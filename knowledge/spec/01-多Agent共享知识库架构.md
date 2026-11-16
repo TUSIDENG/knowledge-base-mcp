@@ -4,12 +4,12 @@ systems: [kb-gateway]
 doc_type: rfc
 status: frozen
 owner: david
-version: 1.1
+version: 1.2
 related: [spec/02-Branch与Worktree与内嵌知识库.md]
 ---
 # 多 Agent 并发开发 · 共享知识库架构设计
 
-> 版本：v1.1（自建方案 · 知识库边界已收敛为"仓库 = 知识库，目录 = 分区"）
+> 版本：v1.2（自建方案 · 增加初始化指导、持久化索引队列、Web 管理与按需模型运行时）
 > 适用场景：个人 / 小团队，维护多个独立项目（如 ERP 中台 + OMS + RPS + PDM），需要多个编码 Agent 各自开发或由一个调度 Agent 统一编排并行开发，所有 Agent 共享同一套项目知识库。
 > 配套文档：《Branch + Worktree 与内嵌知识库搭配使用指南》
 
@@ -29,6 +29,10 @@ related: [spec/02-Branch与Worktree与内嵌知识库.md]
 | G6 | 产出回流 | Agent 开发产出（方案、SQL、脚本、决策记录）可沉淀回知识库，且不污染已冻结的契约 |
 | G7 | 增量更新 | 知识库文档新增/修改后，无需人工全量重建即可被检索到 |
 | G8 | 可溯源 | 任何一条检索结果能回答：来自哪个库、哪个文件、哪个版本、哪个分支 |
+| G9 | 初始化指导 | 任意项目可通过 MCP 获取知识库目录、front matter、注册与首次索引的完整初始化清单 |
+| G10 | 队列化索引 | 向量任务持久化、幂等、可重试，服务重启不丢任务，失败原因和索引进度可查询 |
+| G11 | Web 管理 | 可管理知识库、每库向量开关、索引任务、提案审查和线上/本地向量模型 |
+| G12 | 按需模型运行时 | 纯线上模式不安装机器学习依赖；仅首次运行本地模型时通过 uv 安装可选运行时 |
 
 ### 1.2 明确不做的事（边界）
 
@@ -41,7 +45,9 @@ related: [spec/02-Branch与Worktree与内嵌知识库.md]
 
 | 决策点 | 选择 | 理由 | 放弃的方案及原因 |
 |---|---|---|---|
-| 知识库服务形态 | **MCP Server（stdio 优先，可选 HTTP）** | Cursor / Codex / OpenCode / Gemini CLI 全部原生支持 MCP，一套协议对接所有 Worker，不用为每个 Agent 写适配 | 自研 REST SDK：每个 Agent 都要写适配器，且无法复用其工具调用循环 |
+| 知识库服务形态 | **单实例服务（MCP + Web，stdio 可选）** | 一套 MCP 对接所有 Worker；HTTP 实例同时挂载管理 API/UI，统一管理 watcher、队列与索引写入 | 独立 Web 索引进程：会产生多写者竞争；自研 Agent REST SDK：无法复用 MCP 工具调用循环 |
+| 索引任务 | **SQLite 持久化队列** | 与元数据共用事务和备份，支持重启恢复、幂等、重试，个人场景无需额外 MQ | 内存队列：重启丢任务；独立 MQ：增加部署与运维成本 |
+| 模型运行时 | **线上 / 本地双通道，本地依赖按需安装** | 线上配置即连即用；本地模型满足离线需求，基础安装保持轻量 | 基础依赖预装 torch 等库：即使用户只用线上模型也承担大量下载 |
 | 向量存储 | **LanceDB（嵌入式，单目录）** | 零服务、单文件夹可备份、支持多表（一个 kb 一张表）、支持标量过滤 | Milvus/Qdrant 服务端：个人场景运维成本不值；Chroma：并发写弱于 LanceDB |
 | 元数据存储 | **SQLite（WAL 模式）** | 单文件、事务可靠、支持并发读+串行写，天然适合个人场景 | PostgreSQL：为个人知识库引入 PG 只增加了部署负担 |
 | 分块与解析 | 自建 Parser（Markdown 优先） | 必须自己控制表格、图片、代码块的处理方式，通用加载器会丢结构 | 通用文档加载库：表格被拍平、代码块被误切 |
@@ -77,15 +83,19 @@ related: [spec/02-Branch与Worktree与内嵌知识库.md]
                       │  MCP (JSON-RPC)  ——  所有 Agent 走同一条协议
                       ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                     KB Gateway（自建 MCP Server，单进程）                  │
+│                     KB Gateway（MCP + Web，单实例）                        │
 │  ┌────────────────────────────────────────────────────────────────────┐  │
-│  │ Tool 面：kb_list / kb_search / kb_read / kb_write_candidate        │  │
-│  │          kb_stat / kb_reindex                                      │  │
+│  │ Tool 面：kb_init_guide / kb_list / kb_search / kb_read             │  │
+│  │          kb_write_candidate / kb_stat / kb_reindex                 │  │
 │  ├────────────────────────────────────────────────────────────────────┤  │
-│  │ 检索面：Query Router → 向量召回 → BM25 召回 → RRF 融合 → 重排      │  │
+│  │ 管理面：Web UI + /api（知识库 / 索引任务 / 提案 / 模型）            │  │
+│  ├────────────────────────────────────────────────────────────────────┤  │
+│  │ 检索面：Query Router → 向量召回（可关闭）→ BM25 → RRF → 重排        │  │
 │  │          （按 kb 授权列表 + 标签过滤器做前置裁剪）                  │  │
 │  ├────────────────────────────────────────────────────────────────────┤  │
-│  │ 索引面：File Watcher（增量） / Git Hook（提交后增量） / 全量重建   │  │
+│  │ 索引面：Watcher / Git Hook / Ref 对账 → SQLite 持久化任务队列      │  │
+│  ├────────────────────────────────────────────────────────────────────┤  │
+│  │ 模型面：线上配置 / 本地下载与运行 / uv 可选依赖                     │  │
 │  ├────────────────────────────────────────────────────────────────────┤  │
 │  │ 共享面：读写配额、提案队列、版本快照、并发写仲裁                    │  │
 │  └────────────────────────────────────────────────────────────────────┘  │
@@ -95,7 +105,7 @@ related: [spec/02-Branch与Worktree与内嵌知识库.md]
 ┌──────────────────────────────┐   ┌───────────────────────────────────────┐
 │  KB Registry（注册表）        │   │  存储层                                │
 │  kb_registry.yaml             │   │  ├─ LanceDB：每 kb 一张表（向量+全文） │
-│  · kb_id / source_type        │   │  ├─ SQLite：文档元数据/分块/版本/提案  │
+│  · kb_id / source_type        │   │  ├─ SQLite：元数据/版本/提案/索引任务  │
 │  · repo / knowledge_root      │   │  ├─ Blackboard：SQLite 表（多 Agent 共享│
 │  · prefix_rules（目录分区）   │   │  └─ 原始文件：KB 目录本身（不复制）    │
 │  · read_grants（Agent 白名单）│   └───────────────────────────────────────┘
@@ -180,15 +190,28 @@ related: [spec/02-Branch与Worktree与内嵌知识库.md]
 version: 1
 
 embedding:
-  provider: local                      # local | openai | gemini
-  model: bge-m3                        # 本地默认，离线可用
-  dim: 1024
-  batch_size: 16
+  active_profile: openai-default       # 全局唯一活动配置，切换后按代次重建向量
+  profiles:
+    - profile_id: openai-default
+      type: online                     # 不安装任何本地机器学习依赖
+      provider: openai                 # openai | gemini | 兼容 OpenAI 的服务
+      endpoint: https://api.openai.com/v1
+      model: text-embedding-3-small
+      secret_ref: env:OPENAI_API_KEY   # API 响应永不回显密钥
+      dim: 1536
+      batch_size: 16
+    - profile_id: local-bge-m3
+      type: local                      # 首次启动时才安装 local-models extra
+      model: BAAI/bge-m3
+      revision: main                   # 实际使用应固定为 commit SHA
+      dim: 1024
+      batch_size: 16
 
 storage:
   lancedb_path: ~/.kb-gateway/data/lance
   sqlite_path: ~/.kb-gateway/data/meta.db
   blackboard_path: ~/.kb-gateway/data/blackboard.db
+  model_cache_path: ~/.kb-gateway/models  # 本地下载只能落在该目录内
 
 knowledge_bases:
   # ---------- 唯一一个"标准性资产"仓库 ----------
@@ -200,6 +223,7 @@ knowledge_bases:
     exclude: ["**/.git/**", "**/.obsidian/**", "**/_archive/**"]
     default_authority: contract        # 契约：检索结果带 authoritative 标记
     default_write: read_only           # 只读，Agent 只能提案
+    vector_enabled: true               # false 时只维护 BM25，不生成向量任务
 
   # ---------- 项目仓库（每个项目一条，kb_id 固定写死） ----------
   - kb_id: erp-core
@@ -213,6 +237,7 @@ knowledge_bases:
     allow_working_ref: true            # 允许 working:<task> 草稿索引
     default_authority: note
     default_write: proposal_only
+    vector_enabled: true
     prefix_rules:                      # 目录驱动的分区策略，glob 匹配
       - glob: "knowledge/spec/**"
         authority: contract            # 本项目内已冻结的设计视为契约
@@ -230,6 +255,7 @@ knowledge_bases:
     index_ref: main
     default_authority: note
     default_write: proposal_only
+    vector_enabled: false              # 示例：仅全文检索
 ```
 
 **字段语义说明：**
@@ -244,6 +270,8 @@ knowledge_bases:
 | `index_ref` | `main` / 其他分支 | 默认索引的基准分支 |
 | `serve_refs` | 分支白名单 | 对外可检索的 ref；新增分支必须显式登记 |
 | `allow_working_ref` | 布尔 | 是否允许 `ref=working:<task>` 索引未提交草稿 |
+| `vector_enabled` | 布尔 | 每库向量开关；关闭后仍维护 BM25，不产生 embedding 任务，检索明确降级 |
+| `embedding.active_profile` | profile ID | 全局活动向量模型；切换模型或维度会创建新索引代次，完成后原子切换 |
 
 **检索侧对应的参数变化：**
 
@@ -371,11 +399,13 @@ query
   │    doc_type / status / domain / systems / effective_from
   │    → LanceDB where 条件，先裁剪候选池
   │
-  ├─ 2. 向量召回：top_k * 3（宽召回）
+  ├─ 2. 向量召回：top_k * 3（仅 vector_enabled=true 且向量代次 ready）
+  │    若向量关闭、未就绪或模型不可用则跳过，并记录 degraded_reason
   │
   ├─ 3. BM25 召回：对 enriched_text（正文 + 表头 + 代码符号名）做全文检索，top_k * 3
   │
   ├─ 4. RRF 融合：score = Σ 1/(60 + rank_i)
+  │    仅 BM25 可用时直接按全文排序，不伪造向量分数
   │
   ├─ 5. 权威加权：authoritative=true（来自 contract 库）的块 × 1.15
   │    status=frozen × 1.1；status=deprecated 直接剔除
@@ -409,6 +439,8 @@ query
 
 `abs_path` 与 `git_ref` 是溯源能力的核心：Agent 拿到结果后可以直接 `kb_read(abs_path)` 读全文，也可以在你人工核对时一眼定位到"哪条分支的哪个提交"。
 
+`kb_search` 的响应头另含 `effective_mode`（`hybrid` / `bm25` / `vector`）与 `degraded_reason`。`vector_enabled=false` 时，默认 `hybrid` 自动降级为 BM25；调用方显式请求 `mode=vector` 则返回 `vector_disabled`，提示在 Web 或注册表中开启。重新开启后，服务按内容哈希与模型代次补建缺失向量，ready 前仍明确降级检索。
+
 ### 3.7 共享语义：为什么必须是"共享读 + 提案写"
 
 多 Agent 并发开发时，知识库的共享不是一个"能不能读"的问题，而是一个"谁能改"的问题。
@@ -431,7 +463,7 @@ Worker 产出                提案队列                    归档
     │                         │                          │
     │                    ┌────┴────┐                     │
     │                    ▼         ▼                     │
-    │              人工/调度审核  自动拒绝                 │
+    │              Web/人工/调度审核  自动拒绝              │
     │                    │                                 │
     │                    ▼                                 │
     │              kb_commit_proposal ────────────────────▶ 写入 KB 目录
@@ -443,21 +475,25 @@ Worker 产出                提案队列                    归档
 - `base_version` 校验：提案基于的文档版本若已被别人改过，提案自动标 `stale`，需重新生成。这解决了并发写冲突。
 - `target_path` 必须在 `proposal_allow` 白名单内（如 `decisions/`、`rfc/`、`artifacts/`），**不允许直接提案改 `api/`、`db/mapping-*`**——契约类文件的变更必须走人。
 - 提案内容存 SQLite，Agent 不需要有 KB 目录写权限（注册表只给网关进程写权限，Worker 进程无）。
+- Web 审查页必须展示 diff、提交者、理由、`base_version` 与审计记录；批准前再次校验版本，`stale` 提案禁止批准，只能拒绝或要求重新生成。批准后的文档变更统一进入持久化索引队列。
 
 ---
 
 ## 4. MCP 接口设计
 
-网关对外暴露 6 个工具，收敛得越少越好，Agent 提示词才好写。
+网关对外暴露 7 个工具，收敛得越少越好，Agent 提示词才好写。
 
 | 工具 | 入参 | 返回 | 用途 |
 |---|---|---|---|
-| `kb_list` | `include_prefixes?` | kb 清单 + 每个库的 `doc_count / last_indexed / default_authority / default_write` | Agent 启动时自检可用知识域 |
-| `kb_search` | `query`, `kb_id`, `prefixes[]`, `refs?`, `filters?`, `top_k=5`, `mode=hybrid` | 命中块数组（见 3.6 结构） | 主力检索入口 |
+| `kb_init_guide` | `source_type`, `repo?`, `kb_id?`, `knowledge_root=knowledge`, `check=false` | 初始化步骤、目录/front matter/registry 模板、接入命令；`check=true` 时附校验结果 | 指导其他项目创建并接入知识库 |
+| `kb_list` | `include_prefixes?` | kb 清单 + 每个库的 `doc_count / last_indexed / vector_enabled / default_authority / default_write` | Agent 启动时自检可用知识域 |
+| `kb_search` | `query`, `kb_id`, `prefixes[]`, `refs?`, `filters?`, `top_k=5`, `mode=hybrid` | 命中块数组（见 3.6 结构）+ `effective_mode / degraded_reason` | 主力检索入口 |
 | `kb_read` | `path` 或 `doc_id`, `with_frontmatter=true` | 原文全文 + front matter + git_ref | 精读单篇；也用于 Agent 读源码级文档 |
 | `kb_write_candidate` | `kb_id`, `target_path`, `content`, `reason`, `task_id` | `proposal_id` + 状态 | 产出沉淀 |
-| `kb_stat` | `kb_id`, `prefixes?` | 分块统计、最近变更、索引延迟 | 排查"文档明明有却搜不到" |
-| `kb_reindex` | `kb_id`, `ref=main`, `full=false` | 重建结果 | 手动修复索引 |
+| `kb_stat` | `kb_id`, `prefixes?` | 文档/分块/向量块统计、向量维度、`observed_rev/indexed_rev`、dirty 状态、队列数量、索引延迟、模型代次与最后错误 | 排查"文档明明有却搜不到" |
+| `kb_reindex` | `kb_id`, `ref=main`, `full=false` | `job_id` + `queued` 状态 | 异步手动修复索引 |
+
+**`kb_init_guide` 的安全边界：** 它只返回指导和可选校验结果，不创建目录、不写 registry、不安装 hook、不下载模型。返回内容按 `source_type` 区分独立库与项目内嵌库，包含 `knowledge/index.md`、front matter、registry 片段、CLI/Web 创建方式、首次索引和 MCP 接入步骤；`check=true` 时只读校验提供的 `repo`。实际变更必须由 CLI 或 Web 的明确操作执行，避免 Agent 借指导工具获得隐式文件写权限。
 
 **`kb_search` 为什么要强制传 `kb_id` + `prefixes`（不给默认全局搜索）：**
 
@@ -472,8 +508,8 @@ Worker 产出                提案队列                    归档
 {
   "mcpServers": {
     "kb-gateway": {
-      "command": "python",
-      "args": ["-m", "kb_gateway.server"],
+      "command": "uv",
+      "args": ["run", "--project", "D:/code/knowledge-base-mcp", "kb-gateway", "serve", "--transport", "stdio"],
       "env": {
         "KB_CONFIG": "/home/david/.kb-gateway/kb_registry.yaml",
         "KB_AGENT_ID": "cursor-main"
@@ -486,8 +522,8 @@ Worker 产出                提案队列                    归档
 ```toml
 # Codex CLI: ~/.codex/config.toml
 [mcp_servers.kb-gateway]
-command = "python"
-args = ["-m", "kb_gateway.server"]
+command = "uv"
+args = ["run", "--project", "D:/code/knowledge-base-mcp", "kb-gateway", "serve", "--transport", "stdio"]
 env = { KB_CONFIG = "/home/david/.kb-gateway/kb_registry.yaml", KB_AGENT_ID = "codex-worker-1" }
 ```
 
@@ -790,14 +826,35 @@ CREATE UNIQUE INDEX idx_lease_holder ON blackboard_lease(run_id, holder_agent);
 ### 9.2 索引一致性策略
 
 ```
-写入路径：文件变更 → watcher 事件 → debounce 队列 → 解析分块 → embedding → 
-         LanceDB upsert（按 doc_id 覆盖旧块）→ SQLite 元数据更新 → 标记完成
+写入路径：变更事件 → debounce / 内容哈希 → SQLite 持久化入队 → 解析分块
+         → BM25 / metadata 更新 → embedding（仅 vector_enabled=true）
+         → LanceDB 按代次 upsert → 标记任务完成 → 推进索引版本
 
 一致性保证：
-  · 每次 upsert 以 doc_id 为粒度做"先删该 doc 全部旧块，再插入新块"，避免残留
-  · 同一 doc 的并发修改由单一 indexer 线程串行处理（单写者模型）
+  · 每次 upsert 以 doc_id + model_generation 为粒度替换旧块，避免残留
+  · 同一 doc 的并发修改由单一 indexer 写者串行发布，embedding 可有界并行
   · 索引状态表记录每个 doc 的 content_hash，hash 未变则跳过（幂等）
+  · 任一文档任务失败则不推进对应 ref 的 indexed_rev，旧索引继续服务
 ```
+
+### 9.3 持久化索引队列与状态
+
+索引任务与文档元数据共用 SQLite（WAL），不引入独立 MQ。任务类型至少包括 `index_document`、`delete_document`、`rebuild_kb`、`runtime_install` 和 `model_download`，统一在 Web 展示；文档任务字段如下：
+
+| 字段组 | 内容 |
+|---|---|
+| 定位 | `job_id`、`kb_id`、`ref`、`path`、`operation` |
+| 幂等 | `content_hash + model_generation`，与定位字段组成去重键 |
+| 调度 | `status`、`priority`、`attempt`、`next_retry_at`、`lease_owner/lease_expires_at` |
+| 结果 | `total_chunks / embedded_chunks`、`error`、`created_at / started_at / finished_at` |
+
+状态机为 `queued → running → succeeded`；可恢复错误进入 `retry_wait` 后指数退避，超过上限进入 `failed`，也可手动取消为 `cancelled`。服务重启时将过期租约的 `running` 任务回收为 `queued`，chunk ID 由 `(kb_id, ref, path, content_hash, chunk_index, model_generation)` 确定化，保证重放不会制造重复块。
+
+- **去重与合并**：watcher、hook、轮询和手动重建可以重复通知；相同去重键的未完成任务只保留一个。同一文件在去抖窗口内连续变化，只保留最新内容哈希，旧任务若已开始则其结果不得覆盖新代次。
+- **进度与版本**：每库每 ref 记录 `observed_rev`、`indexed_rev`、dirty/待提交状态、各状态任务数、当前模型代次和最后错误。只有该 rev 的全部变更任务成功后才推进 `indexed_rev`；hook 不得提前写“已索引”。
+- **向量开关**：`vector_enabled=false` 时只执行解析、元数据和 BM25 更新，不创建 embedding 子任务，并取消该库尚未开始的向量任务；旧向量不参与检索。重新开启后按内容哈希与模型代次补建，未 ready 前继续使用 BM25。
+- **模型切换**：模型或维度变化生成新的 `model_generation`，为所有 `vector_enabled=true` 的库创建全量任务。旧代次继续检索，新代次按库完整构建后原子切换，失败不影响旧代。
+- **背压**：embedding 采用有界并发和固定批大小，队列长度、重试和死信均可见；不得因本地模型推理阻塞 MCP/Web 请求。
 
 ---
 
@@ -805,20 +862,25 @@ CREATE UNIQUE INDEX idx_lease_holder ON blackboard_lease(run_id, holder_agent);
 
 ```
 kb-dev-system/
-├── kb_gateway/                     # MCP 知识库网关（独立进程）
-│   ├── server.py                   # MCP 入口（stdio / HTTP 双模式）
-│   ├── tools.py                    # 6 个 MCP 工具实现
+├── pyproject.toml                  # uv 项目、基础依赖与 local-models optional extra
+├── uv.lock                         # 锁定依赖；基础同步不包含机器学习运行时
+├── kb_gateway/                     # MCP + Web 单实例知识库网关
+│   ├── server.py                   # MCP / 管理 API / Web UI 入口
+│   ├── tools.py                    # 7 个 MCP 工具实现（含 kb_init_guide）
+│   ├── web/                        # 知识库、索引任务、提案和模型管理页面/API
+│   ├── models/                     # 线上客户端、本地下载/运行、密钥与状态管理
 │   ├── registry.py                 # kb_registry.yaml 解析、两种 source_type 统一
 │   ├── parser/
 │   │   ├── markdown.py             # 表格/代码块/front matter 结构化解析
 │   │   ├── openapi.py              # OpenAPI 按 endpoint 切分
 │   │   └── image.py                # caption 抽取 / 可选多模态描述
 │   ├── chunker.py                  # 分块策略（表格保留表头）
-│   ├── embedder.py                 # 本地 bge-m3 / 远程 API 路由
+│   ├── embedder.py                 # 活动模型路由；本地运行时延迟导入
 │   ├── indexer/
-│   │   ├── watcher.py              # watchdog 增量监听（含 git hook 兜底）
-│   │   ├── full_rebuild.py         # 后台全量重建 + 原子切换
-│   │   └── state.py                # content_hash 幂等表
+│   │   ├── watcher.py              # watchdog 去抖 + Git ref / 文件指纹定时对账
+│   │   ├── queue.py                # SQLite 持久化任务、租约、重试与幂等
+│   │   ├── full_rebuild.py         # 后台全量重建 + 模型代次原子切换
+│   │   └── state.py                # content_hash、observed_rev、indexed_rev 状态
 │   ├── search/
 │   │   ├── vector.py               # LanceDB 检索
 │   │   ├── bm25.py                 # 全文检索（含代码符号名）
@@ -888,30 +950,34 @@ grants:
 ## 11. 部署与启动顺序
 
 ```bash
-# 1. 初始化网关
-pip install kb-gateway            # 或从源码: pip install -e .
-kb-gateway init --config ~/.kb-gateway/kb_registry.yaml
+# 1. 基础安装（适用于线上模型，不安装 torch/transformers 等本地运行时）
+uv sync
+uv run kb-gateway init --config ~/.kb-gateway/kb_registry.yaml
 
-# 2. 建唯一的"标准性资产"仓库（跨项目共享、跨系统契约）
+# 2. 建唯一的"标准性资产"仓库（也可在 Web 新增）
 mkdir -p D:/code/kb-standards/{standards,cross-system}
-kb-gateway kb add --id standards --source-type external --repo D:/code/kb-standards
+uv run kb-gateway kb add --id standards --source-type external --repo D:/code/kb-standards
 
-# 3. 建项目内嵌知识库（每个项目一条；内嵌目录随项目 git 走）
+# 3. 建项目内嵌知识库（Agent 可先调用 kb_init_guide 获取清单）
 cd D:/code/erp-core
 mkdir -p knowledge/{spec,decisions,_draft}
-kb-gateway kb add --id erp-core --source-type embedded --repo . --knowledge-root knowledge
+uv run --project D:/code/knowledge-base-mcp kb-gateway kb add --id erp-core --source-type embedded --repo . --knowledge-root knowledge
 
-# 4. 首次全量索引（后台，带进度；走对象库而非磁盘）
-kb-gateway reindex --all --full --ref main --progress
+# 4. 在终端一启动常驻服务（MCP + Web + watcher + 队列消费者）
+uv run --project D:/code/knowledge-base-mcp kb-gateway serve --transport http --host 127.0.0.1 --port 8765 --watch
+# Web: http://127.0.0.1:8765/
 
-# 5. 常驻服务（HTTP 模式，供多 Agent 共享）
-kb-gateway serve --transport http --port 8765 --watch
+# 5. 在终端二触发首次全量索引（异步入队；也可在 Web 操作）
+uv run --project D:/code/knowledge-base-mcp kb-gateway reindex --all --full --ref main --progress
 
 # 6. 接入各 Agent（见 4 章配置片段），验证
-kb-gateway doctor --agent cursor-main        # 检查 MCP 握手、授权、检索往返
+uv run --project D:/code/knowledge-base-mcp kb-gateway doctor --agent cursor-main
+
+# 仅当准备运行本地模型时才需要安装；Web 首次启动本地模型会执行等价任务
+uv sync --extra local-models
 ```
 
-**`doctor` 子命令是必要的**——知识库这类基础设施的故障往往表现为"Agent 说没找到资料"，根因可能是授权配错、watcher 没起、embedding 维度不匹配、路径符号链接没解析。把这些检查收敛成一条命令，能省掉大量排查时间。
+**`doctor` 子命令是必要的**——知识库这类基础设施的故障往往表现为"Agent 说没找到资料"，根因可能是授权配错、watcher 没起、队列积压、本地运行时缺失、embedding 维度不匹配、路径符号链接没解析。把这些检查收敛成一条命令，能省掉大量排查时间。
 
 ---
 
@@ -919,12 +985,12 @@ kb-gateway doctor --agent cursor-main        # 检查 MCP 握手、授权、检�
 
 | 阶段 | 范围 | 预计工作量 | 验收 |
 |---|---|---|---|
-| **P0 打底** | 网关最小闭环：registry 解析 + Markdown 解析分块 + LanceDB 索引 + `kb_search`/`kb_read`/`kb_list`（stdio 模式） | 2~3 天 | Cursor 里能检索到你某个库的文档，结果带路径溯源 |
-| **P1 混合检索** | BM25 + RRF 融合 + front matter 过滤 + 表格/代码块专项处理 | 2 天 | 用真实映射表验证：搜单个字段名能命中那一行映射 |
-| **P2 双形态** | embedded 库支持（worktree 下只索引主工作区）+ git hook + watcher 增量 | 1~2 天 | 项目仓库内 `knowledge/` 改文件 30 秒内可检索 |
-| **P3 共享写** | proposal 队列 + base_version 校验 + 提案归档 + 审计 | 2 天 | 两个 Worker 同时提交同文件提案，后者标 stale 而非覆盖 |
+| **P0 打底** | uv 项目 + registry + Markdown 分块 + LanceDB + `kb_search`/`kb_read`/`kb_list` + `kb_init_guide` | 2~3 天 | Cursor 能检索并溯源；新项目仅凭初始化工具即可获得完整建库清单 |
+| **P1 混合检索** | BM25 + RRF + front matter 过滤 + 每库 `vector_enabled` 与明确降级 | 2 天 | 精确字段命中映射行；关闭向量后仍可 BM25 检索且不产生向量任务 |
+| **P2 双形态与队列** | embedded 库 + git hook + watcher + 定时对账 + SQLite 持久化队列 + Web 索引状态 | 1~2 天 | 提交后 30 秒内入队可检索；重复事件幂等；hook 缺失可收敛；重启任务恢复 |
+| **P3 共享写与 Web** | proposal + base_version + 审计 + Web 知识库配置/提案 diff 审查 | 2 天 | 并发提案后者标 stale；Web 可新增配置知识库且不能批准 stale 提案 |
 | **P4 并发编排** | Orchestrator：DAG 引擎 + worktree 分配 + 三个 Adapter + 黑板 + 合并冲突检测 | 3~5 天 | 三个异构 Worker 并行跑不同任务，产物可合并，黑板数据正确传递 |
-| **P5 闭环与增强** | 产出自动归档、ADR 模板、`kb_stat`、图片 caption、可选多模态 embedding | 2 天 | 完整跑一轮"检索→开发→归档→再检索命中上次记录"闭环 |
+| **P5 模型与闭环增强** | Web 线上/本地模型管理、按需 local-models、模型代次切换 + 产出归档/ADR/图片 caption | 2 天 | 基础安装无 ML 依赖；本地安装下载运行可观测；模型切换不混维度；知识流转闭环可运行 |
 
 **建议严格按 P0→P5 推进，每个阶段结束你都应该能实际用起来。** 不要一次把 P4 的编排写完再回头调检索——检索质量不到位时，并行 Worker 只会更快地产出错误代码。
 
@@ -934,12 +1000,16 @@ kb-gateway doctor --agent cursor-main        # 检查 MCP 握手、授权、检�
 
 | 风险 | 表现 | 对策 |
 |---|---|---|
-| **索引重复** | worktree 导致同一 `knowledge/` 被索引 N 份 | `index_ref: main` + 只索引主工作区 + git hook 兜底 |
+| **索引重复** | worktree 或重复事件导致同一文档被索引 N 次 | committed 索引走 git-object + 队列去重键 + 单写者发布 |
+| **手工修改漏索引** | 绕过 Worker 改文档，或 hook 漏装/事件丢失 | watcher 去抖 + hook 通知 + 定时 ref/内容指纹对账；git-object 未提交只标待提交 |
+| **队列状态失真** | hook 已写完成但 embedding 失败，或服务重启丢任务 | hook 只入队；全部任务成功后推进 indexed_rev；持久化租约与重试 |
 | **契约漂移** | 多个 Worker 各自"理解"接口，代码对不上 | contract 库标记 `authoritative`，检索结果加权，提示词强制"契约优先" |
 | **提案污染** | Agent 大量低质提案淹没审核队列 | 每任务提案数上限（如 3 条）+ `target_path` 白名单 + 自动去重（content_hash） |
 | **黑板死锁** | Worker 崩溃后 key 租约不释放 | 租约 `expires_at` + 调度器定期清理 |
 | **检索噪音** | 语义检索把无关文档排前面 | 强制传 `kb_id + prefixes` + `doc_type`/`status` 前置过滤 + RRF 融合 |
-| **embedding 打架** | 不同库用了不同模型/维度，检索结果不可比 | 注册表全局唯一 embedding 配置，启动时校验维度一致性，不通过直接拒绝启动 |
+| **embedding 打架** | 不同模型/维度混入同一索引，检索结果不可比 | 全局唯一活动配置；模型切换新建 model_generation，完整重建后按库原子切换 |
+| **本地依赖过重** | 只用线上模型也被迫下载 torch 等大型库 | 基础 uv 依赖排除 ML 库；仅 Web 启动本地模型时安装 local-models extra |
+| **密钥或模型路径泄露** | API 回显密钥，或模型下载写到任意目录 | secret_ref + 响应脱敏；下载路径限制在 model_cache_path 并拒绝目录穿越 |
 | **Agent 越权** | Worker 检索到不该看的目录 | grants 的 (kb_id, prefix) 白名单 + 默认拒绝 + 审计日志告警 |
 | **上下文爆炸** | 一次检索返回几十块塞满窗口 | `top_k` 默认 5，返回内容截断 + 只回 `chunk` 不回全文 + 需要时再 `kb_read` |
 | **表格丢失** | 映射表按行拍平，字段搜不到 | 表格整表切分 + 重复表头（3.5） |
@@ -955,14 +1025,54 @@ kb-gateway doctor --agent cursor-main        # 检查 MCP 握手、授权、检�
 | 库/分区授权 + 越权拒绝 | ✅ 白名单硬校验 | ✅ 有 ACL | ⚠️ 权限较粗 | ❌ |
 | 契约/过程/产出三类资产分层 | ✅ authority + write_policy | ✅ 有资产分类 | ⚠️ 需靠标签 | ❌ |
 | Markdown 表格/代码块专项处理 | ✅ 自控 | ❌ 通用切片 | ❌ 通用切片 | ❌ |
-| 增量索引（文件监听 + git hook） | ✅ | ❌ 手动 ingest | ⚠️ 手动/部分 | ❌ |
+| 增量索引（watcher + hook + 对账 + 持久化队列） | ✅ | ❌ 手动 ingest | ⚠️ 手动/部分 | ❌ |
 | 异构 Worker（codex/opencode/gemini） | ✅ Adapter 自由 | ⚠️ 需走 Proxy | ❌ 不涉及 | ✅ 原生 |
 | 黑板通信 | ✅ 完全自控 | ⚠️ 记忆层非通信层 | ❌ | ✅ 内置 |
-| 部署复杂度 | 低（单进程 + 两个文件） | 中（PG/TCVDB + 服务） | 高（容器/DB/账号） | 低（桌面应用） |
+| 部署复杂度 | 低（uv + 单进程 + 嵌入式存储，本地模型按需） | 中（PG/TCVDB + 服务） | 高（容器/DB/账号） | 低（桌面应用） |
 | 可改造性 | ✅ 全代码在手 | ⚠️ 团队向，改动成本高 | ⚠️ 二次开发门槛 | ❌ 黑盒 |
 | 适合你的场景（个人/多项目/契约协同） | ✅ | ⚠️ 团队包袱重 | ⚠️ 太重且不灵活 | ⚠️ 只能验证不能长期 |
 
 **结论**：你的核心诉求是"共享 + 授权 + 双形态 + 契约优先 + 增量"，这五项组合没有任何现成系统同时满足。TencentDB-Agent-Memory 最接近，但它的定位是团队记忆底座（多租户、成员、权限体系都是为多人设计的），且缺文件监听和表格专项处理；Dify 定位是应用侧 RAG，物理形态被平台锁死。自建的成本集中在 P0~P2（约 5~7 天），换来的是这套底座未来所有项目都能复用、且随时可以按需扩展。
+
+---
+
+## 15. Web 管理与向量模型
+
+### 15.1 单实例管理面
+
+`kb-gateway serve --transport http` 在同一进程挂载 `/mcp`、管理 REST `/api` 和 Web UI。Watcher、定时对账、任务调度器、索引写入器和模型管理器都由这一实例持有；Web 不另起索引进程。默认仅监听 `127.0.0.1`，如绑定非回环地址必须另配访问认证。
+
+| 页面 | 核心能力 | 主要 API |
+|---|---|---|
+| 知识库 | 新增、编辑、启停、校验路径与授权、设置 `vector_enabled`、触发全量/增量重建 | `GET/POST /api/kbs`、`GET/PATCH /api/kbs/{kb_id}`、`POST /api/kbs/{kb_id}/reindex` |
+| 索引状态 | 展示 `observed_rev/indexed_rev`、向量块数/维度、dirty/待提交、队列进度、模型代次、最后错误；重试失败任务 | `GET /api/kbs/{kb_id}/index-status`、`GET /api/jobs`、`POST /api/jobs/{job_id}/retry` |
+| 提案审查 | 查看 diff、提交者、理由、base_version 和审计；批准/拒绝，禁止批准 stale | `GET /api/proposals`、`GET /api/proposals/{id}`、`POST /api/proposals/{id}/approve|reject` |
+| 向量模型 | 新增/编辑配置、线上连接测试、切换活动配置、本地安装/下载/启动/停止与进度 | `/api/models`、`/api/models/{id}/test|activate|install|download|start|stop` |
+
+知识库新增和配置修改先校验 `kb_id` 唯一性、真实路径、Git 仓库边界和目录权限，再原子更新 registry 并记录审计。关闭向量不会删除文档和 BM25；模型、索引及提案操作全部复用第 9 章的持久化任务与状态，不通过 UI 同步阻塞执行。
+
+### 15.2 线上与本地模型
+
+模型配置支持多个 profile，但 `embedding.active_profile` 同时只有一个，所有启用向量的库共用该活动配置，避免同一检索链路混入不同模型或维度。
+
+- **线上模型**：填写 provider、endpoint、model、dim、batch_size 和 API key。密钥保存为 `secret_ref`，读取接口只返回 `configured: true` 等脱敏状态；连接测试不会触发任何本地机器学习依赖安装。
+- **本地模型**：填写受支持的模型 ID、固定 revision 和运行时参数。模型文件只能下载到 `storage.model_cache_path` 内由服务生成的目录，拒绝自定义越界路径与目录穿越；记录下载进度、校验结果、runtime 状态和错误。
+- **状态展示**：运行时安装、模型下载、模型运行是三个独立状态。Web 分别展示 `installing/installed/failed`、下载百分比与 `stopped/starting/running/unhealthy`，失败可重试，切换模型后按第 9 章重建索引代次。
+
+### 15.3 uv 与按需依赖
+
+项目由 uv 管理，`pyproject.toml` 声明基础依赖和可选 extra，`uv.lock` 锁定版本：
+
+```toml
+[project.optional-dependencies]
+local-models = [
+  "torch",
+  "transformers",
+  "sentence-transformers",
+]
+```
+
+基础 `uv sync` 和纯线上模式只安装 MCP、Web、解析、检索等基础依赖，**不得包含本地机器学习库**，服务入口也不得在启动时导入这些库。首次在 Web 点击“启动本地模型”时，服务先创建 `runtime_install` 任务，通过 uv 安装 `local-models` extra，再确保模型已下载并启动；本地运行时采用延迟导入/独立子进程隔离。**只有启动本地模型才触发运行时安装，仅下载模型文件不安装机器学习依赖**；CLI 可执行等价的 `uv sync --extra local-models`。
 
 ---
 

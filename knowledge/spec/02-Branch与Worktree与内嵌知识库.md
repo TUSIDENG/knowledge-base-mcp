@@ -4,14 +4,14 @@ systems: [git, kb-gateway]
 doc_type: guide
 status: frozen
 owner: david
-version: 1.0
+version: 1.1
 related: [spec/01-多Agent共享知识库架构.md]
 ---
 # Branch + Worktree 与内嵌知识库的搭配使用指南
 
 > 配套文档：《多 Agent 并发开发 · 共享知识库架构设计》
 > 本文只解决一个问题：**当知识库的物理载体是项目仓库里的 `knowledge/` 目录时，多分支并行开发下它该怎么索引、怎么检索、怎么避免读到错误的版本。**
-> 版本：v1.0
+> 版本：v1.1（增加持久化队列、手工变更感知与 Web 索引状态）
 
 ---
 
@@ -192,65 +192,62 @@ T2（Worker B，gemini）在 w-t2 做映射校验
 
 ### 6.1 触发时机
 
-| 事件 | 触发什么 | 说明 |
+| 事件 | 服务如何处理 | 说明 |
 |---|---|---|
-| 手动 `kb reindex --kb erp-core --ref main` | committed 通道全量重建 | 首次建库、模型更换 |
-| `post-merge` hook（合并进 main） | committed 通道增量重建（diff 出变更的 blob） | **最重要的一条** |
-| `post-checkout` hook | 若切到被登记的分支，增量重建对应 ref | 可选 |
-| worktree 内 Agent 主动 `kb reindex --ref working:<task>` | working 通道索引该目录 | 开发中看草稿 |
-| 定时扫描（每 15 分钟） | 对已登记 ref 做 `git rev-parse` 比对，变了才重建 | 兜底，防止 hook 漏装 |
+| 手动 `kb-gateway reindex --kb erp-core --ref main` 或 Web 重建 | committed 通道异步入队，返回 `job_id` | 首次建库、模型更换、手工修复 |
+| watcher 发现工作区新增/修改/删除 | 去抖并计算内容哈希；按索引模式决定入队或只标 dirty | 发现 IDE、脚本等绕过 Worker 的变更 |
+| `post-commit` / `post-merge` hook | 通知 HTTP 服务新 rev，由服务计算 Git diff 并入队 | 提交后增量的快速通道 |
+| `post-checkout` hook | 若切到登记分支，通知服务比对并入队 | 可选 |
+| worktree 内 Agent 主动 `kb-gateway reindex --ref working:<task>` | 校验授权和 worktree 绑定后，working 通道异步入队 | 开发中看草稿 |
+| 定时对账（每 15 分钟） | committed 比较 ref 与 indexed_rev；filesystem 比较内容指纹 | 兜底 hook 漏装、watcher 丢事件和服务离线 |
 
-### 6.2 post-merge hook（可直接用）
+### 6.2 post-commit / post-merge hook（可直接用）
 
 ```bash
 #!/bin/bash
-# .git/hooks/post-merge
-# 作用：合并进当前分支后，只重建发生变化的 blob，不全量重跑
-# 安装：chmod +x .git/hooks/post-merge
+# 同一脚本可安装为 .git/hooks/post-commit 和 post-merge
+# 作用：只通知常驻 HTTP 服务； diff、embedding 和完成状态均由服务管理
 
 set -euo pipefail
 
-KB_ID="erp-core"                 # 对应 kb_registry.yaml 里的 kb_id
-KNOWLEDGE_DIR="knowledge"        # 内嵌知识库目录（相对仓库根）
-OLD_REF_FILE=".git/kb-last-indexed-rev"   # 记录上次索引到的 commit
-
-# 1) 取上次索引的 commit；没有就退化为全量
-if [ -f "$OLD_REF_FILE" ]; then
-  OLD_REV=$(cat "$OLD_REF_FILE")
-else
-  OLD_REV=$(git rev-list --max-parents=0 HEAD | tail -1)   # 首个提交
-fi
+KB_ID="erp-core"
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
 NEW_REV=$(git rev-parse HEAD)
 
-# 2) 只取 knowledge 目录下变更的文件列表（A/M/D）
-CHANGED=$(git diff --name-status "$OLD_REV" "$NEW_REV" -- "$KNOWLEDGE_DIR" || true)
-
-if [ -z "$CHANGED" ]; then
-  echo "[kb] knowledge 无变更，跳过索引"
+if ! curl --fail --silent --show-error \
+  -X POST "http://127.0.0.1:8765/api/kbs/${KB_ID}/reindex" \
+  -H "Content-Type: application/json" \
+  --data "{\"ref\":\"${BRANCH}\",\"observed_rev\":\"${NEW_REV}\",\"source\":\"git-object\",\"full\":false}"; then
+  echo "[kb] 服务暂不可用；定时对账会兜底，无需阻塞 Git 操作"
   exit 0
 fi
 
-# 3) 增量重建：带 ref + 变更文件清单交给网关
-#    网关内部按 blob hash 判断是否需要重新 embed（内容没变就复用旧向量）
-echo "$CHANGED" | kb-gateway reindex \
-  --kb "$KB_ID" \
-  --ref "$(git rev-parse --abbrev-ref HEAD)" \
-  --source git-object \
-  --changed-from-stdin \
-  --repo "$(git rev-parse --show-toplevel)"
-
-# 4) 记录本次已索引到的 commit
-echo "$NEW_REV" > "$OLD_REF_FILE"
-echo "[kb] 索引完成 → $NEW_REV"
+echo "[kb] 已异步入队 → $NEW_REV；完成状态请在 Web 索引页或 kb_stat 查看"
 ```
 
 **这段 hook 的三个设计要点：**
 
-- `--source git-object`：明确让网关走对象库读取，而不是磁盘扫描
-- 传「变更文件清单」而不是「变更 commit 范围」：网关可以只对这几个 path 做 `ls-tree`，开销与文件数成正比而非与提交数成正比
-- 记录 `kb-last-indexed-rev`：避免每次 merge 都从头 diff；也让异常中断后能从断点续
+- **只通知，不执行索引**：服务收到 `observed_rev` 后，从 Git 对象库计算 `indexed_rev...observed_rev` 的文档 diff，按 blob/content hash 生成幂等任务。
+- **hook 不记录已索引版本**：`indexed_rev` 只能由服务在该 rev 的全部变更任务成功后推进，避免 embedding 失败却被标记完成。
+- **允许通知失败**：服务离线时 hook 不阻塞提交或合并；下一轮定时 `rev-parse` 对账仍会补入队。post-commit 与 post-merge 重复通知也由队列去重。
 
-### 6.3 合并即回流的语义
+### 6.3 非 Worker 修改：服务如何决定是否重新向量化
+
+watcher 只监听注册表指向的主工作区或显式授权的 `working:<task>` worktree，**不能扫描所有 worktree**。事件先经过去抖和内容哈希判断，再按以下规则处理：
+
+| 情况 | 是否入队向量化 | 对外状态与后续动作 |
+|---|---|---|
+| `filesystem` 模式，内容哈希变化 | 是；`vector_enabled=true` 时生成向量任务，否则只更新 BM25 | 显示队列进度，成功后更新文件指纹 |
+| `git-object` 模式，工作区修改但未提交 | **不进入 main 向量队列** | 标记 `dirty/waiting_commit` 和变更路径，main 仍检索旧提交 |
+| 上述修改随后提交到登记 ref | 是；hook 或轮询发现新 rev，按 Git diff 入队 | 全部任务成功后推进 `indexed_rev`，新内容可检索 |
+| 获授权的 `working:<task>` 修改 | 是；只进入该 working ref | 仅绑定任务的调用方可检索，不污染 main |
+| 内容哈希未变或只有 mtime 变化 | 否 | 跳过，避免无意义 embedding |
+| `vector_enabled=false` | 不产生向量任务 | 仍更新元数据和 BM25，检索返回 BM25 降级状态 |
+| 活动模型或维度变化 | 为所有启用向量的库生成新代次全量任务 | 旧代继续服务，新代完整后按库原子切换 |
+
+因此，“服务知道文件变了”和“主分支应该立即重新向量化”是两件事：**watcher 负责发现，Git 版本语义决定何时入队，内容哈希与模型代次决定是否真正 embedding。** Web 必须展示待提交、排队、运行、失败和完成状态，避免用户把 dirty 误认为索引故障。
+
+### 6.4 合并即回流的语义
 
 这里有个容易被忽略但很关键的点：
 
@@ -295,13 +292,15 @@ knowledge_bases:
 
 ---
 
-## 8. 四种典型场景的完整走法
+## 8. 五种典型场景的完整走法
 
 ### 场景 A：日常单分支维护（无 worktree）
 ```
-你在 ~/work/erp-core 直接改 knowledge/*.md → 提交到 main
-→ post-commit/post-merge hook → 增量索引 ref=main
-→ Agent 检索立刻可见
+你在 ~/work/erp-core 直接改 knowledge/*.md
+→ watcher 去抖 + 内容哈希确认变化 → Web 标记 dirty/waiting_commit
+→ 提交到 main → post-commit/post-merge hook（或 15 分钟对账）
+→ SQLite 持久化增量队列 → embedding/BM25 成功 → 推进 indexed_rev
+→ Agent 检索可见；失败时旧索引继续服务，Web 可重试
 ```
 这是最常用的路径，与是否有 worktree 无关。
 
@@ -312,7 +311,7 @@ Orchestrator 派发 T1/T2/T3
 → Worker A 在 w-t1 内开发，kb 检索默认 ref=main
 → A 改了自己分支的 knowledge → 只能通过 ref=working:w-t1 自己看到
 → A 提交 feature/oms-sync → Orchestrator 登记该 ref（可选）
-→ 合并进 main → post-merge 重建 ref=main → 全场可见
+→ 合并进 main → post-merge 异步入队 → 任务成功后全场可见
 ```
 
 ### 场景 C：Agent 之间要传递"我改了契约"这个信息
@@ -320,7 +319,7 @@ Orchestrator 派发 T1/T2/T3
 ```
 Worker A 完成 → kb_write_candidate(提案) + blackboard_write("schema.oms_order")
 Worker B ← blackboard_read("schema.oms_order") 拿到结构化定义
-人工/调度审核提案 → 合并进 main → 索引重建
+人工/调度在 Web 审查提案 diff（stale 禁止批准）→ 合并进 main → 异步入队重建
 ```
 原因：worktree 里的草稿可能随时被 Agent 继续改，拿去给另一个 Agent 用就是移动的靶子。黑板里的内容是**某一时刻的快照**，有版本号，可仲裁，这是它比"读别人目录"可靠的根本原因。
 
@@ -332,6 +331,15 @@ Worker B ← blackboard_read("schema.oms_order") 拿到结构化定义
 → 需要看旧版：kb_search(..., ref=<old_commit>) 或直接 git show <old>:path
 ```
 
+### 场景 E：重复事件、服务离线或重启
+```
+同一提交同时触发 watcher、post-commit 和 post-merge
+→ 服务按 kb_id/ref/path/content_hash/model_generation/operation 去重
+→ 服务离线导致 hook 通知失败 → 15 分钟 ref 对账补入队
+→ 服务重启 → 过期租约任务恢复为 queued → 已成功 chunk 幂等跳过
+→ 任一任务失败则不推进 indexed_rev → Web 显示错误并允许重试
+```
+
 ---
 
 ## 9. 反模式清单（这几条踩了会很难查）
@@ -341,7 +349,9 @@ Worker B ← blackboard_read("schema.oms_order") 拿到结构化定义
 | 让 watcher 扫描所有 worktree 目录 | 同一文档索引 N 份，检索结果随机命中不同版本 | 走 `git-object` 通道，只按 ref 索引 |
 | 用目录路径当 kb_id | 项目改名/移动后提示词全失效 | kb_id 写死在注册表 |
 | Worker 默认读自己分支的 knowledge | 每个 Agent 基于不同契约开发，合并必炸 | 默认 `ref=main`，草稿必须显式请求 |
-| 用 `mtime` 判断文件是否变化 | `checkout`/`worktree add` 会把所有 mtime 刷新，触发无意义全量重建 | 用 blob hash / commit diff 判断 |
+| 用 `mtime` 判断文件是否变化 | `checkout`/`worktree add` 会把所有 mtime 刷新，触发无意义全量重建 | committed 用 blob hash / commit diff，filesystem 用内容哈希 |
+| hook 直接写 `kb-last-indexed-rev` | 任务尚未完成就标记已索引，失败后永久漏文档 | hook 只通知；服务在全部任务成功后推进 indexed_rev |
+| git-object 未提交修改立即入 main 索引 | 工作区半成品覆盖提交态契约，检索无法溯源 | 只标 dirty/waiting_commit；提交后入队，草稿走 working ref |
 | 分支草稿直接供其他 Agent 检索 | 对方改一次你就过期一次 | 走黑板快照 + 提案合并 |
 | 只装 hook 不做兜底扫描 | hook 漏装（老仓库、clone 后未安装）时索引静默不更新 | 保留 15 分钟 `rev-parse` 比对兜底 |
 | 把 `knowledge/` 放进 `.gitignore` | 知识库失去版本、失去溯源，退回文件系统方案 | 必须被跟踪；大文件用 Git LFS |
@@ -357,8 +367,11 @@ Worker B ← blackboard_read("schema.oms_order") 拿到结构化定义
 - [ ] 注册表里 `index_mode: git-object`，`index_ref: main`
 - [ ] `kb_id` 显式写死，不依赖目录名
 - [ ] `serve_refs` 白名单已配置，新增分支需手动登记
-- [ ] `post-merge` hook 已安装且可执行（`chmod +x`），并在克隆后自动安装（用 `core.hooksPath` 指向版本库内的 hooks 目录）
-- [ ] `post-merge` 能正确记录 `kb-last-indexed-rev`
+- [ ] `post-commit` / `post-merge` hook 已安装且可执行（`chmod +x`），并在克隆后自动安装（用 `core.hooksPath` 指向版本库内的 hooks 目录）
+- [ ] hook 只通知 HTTP 服务，不自行记录已索引版本；Web 可查看 job 和 indexed_rev
+- [ ] watcher 去抖与内容哈希生效，git-object 未提交修改显示 dirty/waiting_commit
+- [ ] 每库 `vector_enabled` 已配置；关闭时只更新 BM25，不产生向量任务
+- [ ] 队列可持久化恢复、重复事件可幂等去重、失败任务可在 Web 重试
 - [ ] 每篇 `knowledge/` 文档有 front matter，含 `doc_type` / `status` / `version`
 - [ ] `draft` 状态默认降权或排除
 - [ ] 网关为单实例 HTTP 模式，`X-Agent-Id` 用于授权解析
@@ -374,5 +387,6 @@ Worker B ← blackboard_read("schema.oms_order") 拿到结构化定义
 > 所以索引不能建在磁盘上（会有 N 份），要建在 Git 对象库上（只有一份，且带 hash）。
 > Agent 默认读 `main` 的提交态，读草稿必须显式指定 `working:<task>`；
 > 跨 Agent 传契约不走目录，走黑板快照 + 提案合并。
+> watcher 负责发现手工变化，hook 与轮询负责通知，持久化队列负责执行；只有全部任务成功才推进 indexed_rev。
 > 这样多个 Worker 能在各自 worktree 里真正并行，而契约始终只有一个真相源。
 </content>

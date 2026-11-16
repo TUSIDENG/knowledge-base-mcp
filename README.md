@@ -50,13 +50,17 @@
 
 ```
 Worker(codex/opencode/gemini) ──MCP──▶ KB Gateway ──▶ 存储
-     ↑                                    ↑
- Orchestrator(可选)               KB Registry（仓库 + 分区规则）
+     ↑                              ↑        ↑
+ Orchestrator(可选)                 │        └─ Watcher / Git Hook / 定时对账
+                              Web 管理 UI + /api
 ```
 
-- **KB Gateway**：单进程 MCP Server，6 个工具（`kb_list` / `kb_search` / `kb_read` / `kb_write_candidate` / `kb_stat` / `kb_reindex`）
-- **检索链路**：授权裁剪 → front matter 过滤 → 向量召回 → BM25 召回 → RRF 融合 → 权威加权
-- **索引**：走 Git 对象库（`git show <ref>:<path>`），不扫磁盘，因为 worktree 会让 `knowledge/` 变成 N 份副本
+- **KB Gateway**：单实例 MCP + Web 服务，7 个工具（`kb_init_guide` / `kb_list` / `kb_search` / `kb_read` / `kb_write_candidate` / `kb_stat` / `kb_reindex`）
+- **初始化指导**：其他项目调用 `kb_init_guide` 即可获得目录、front matter、registry、首次索引与接入清单；工具本身不写文件
+- **检索链路**：授权裁剪 → front matter 过滤 → 向量召回（每库可关闭）→ BM25 → RRF 融合 → 权威加权；向量不可用时明确降级
+- **索引**：committed 内容走 Git 对象库（`git show <ref>:<path>`）；watcher、hook 和定时对账统一进入 SQLite 持久化队列，支持幂等、重试和重启恢复
+- **Web 管理**：新增和配置知识库、查看队列与索引版本、审查提案 diff、管理线上/本地向量模型
+- **模型依赖**：uv 管理项目；线上模型零本地 ML 依赖，只有首次运行本地模型才安装 `local-models` extra 并下载模型
 - **并发隔离**：每个 Worker 一个独立 `git worktree`
 - **通信**：Worker 之间不直接对话，通过黑板读写同一 key 交换数据契约
 
@@ -76,7 +80,8 @@ knowledge-base-mcp/
 │   └── _draft/                   # 草稿区
 │
 └── (待建) 代码目录
-    ├── kb_gateway/               # MCP 网关：registry / parser / chunker / embedder / indexer / search / proposal
+    ├── pyproject.toml + uv.lock   # uv 项目；local-models 为可选 extra
+    ├── kb_gateway/               # MCP + Web：registry / parser / indexer.queue / search / proposal / models
     ├── orchestrator/             # 调度层（可选启用）：planner / scheduler / dispatcher / blackboard / merger
     ├── workers/                  # WorkerAdapter + codex/opencode/gemini 三个适配器
     └── config/                   # kb_registry.yaml / agent_grants.yaml / orchestrator.yaml
@@ -89,21 +94,26 @@ knowledge-base-mcp/
 ## 快速开始（P0，尚未实现）
 
 ```bash
-# 1. 安装
-pip install -e .
+# 1. 基础安装（使用线上向量模型；不安装本地机器学习依赖）
+uv sync
 
-# 2. 注册本仓库自身为知识库
-kb-gateway kb add --id knowledge-base-mcp --source-type embedded --repo . --knowledge-root knowledge
+# 2. 注册本仓库自身为知识库（其他项目可先调用 kb_init_guide 获取清单）
+uv run kb-gateway kb add --id knowledge-base-mcp --source-type embedded --repo . --knowledge-root knowledge
 
-# 3. 首次索引（走 Git 对象库，不扫磁盘）
-kb-gateway reindex --kb knowledge-base-mcp --ref main --full --progress
+# 3. 在终端一启动 HTTP 单实例（MCP + Web + watcher + 持久化队列消费者）
+uv run kb-gateway serve --transport http --host 127.0.0.1 --port 8765 --watch
 
-# 4. 启动服务（多 Agent 共享必须用 HTTP 单实例，避免多个进程重复索引）
-kb-gateway serve --transport http --port 8765 --watch
+# 4. 在终端二触发首次索引（异步入队；也可在 Web 点击重建）
+uv run kb-gateway reindex --kb knowledge-base-mcp --ref main --full --progress
 
-# 5. 接入 Cursor / Codex / OpenCode / Gemini（配置见设计文档第 4 章）
-kb-gateway doctor --agent cursor-main
+# 5. 接入 Cursor / Codex / OpenCode / Gemini 并检查
+uv run kb-gateway doctor --agent cursor-main
+
+# 仅当准备运行本地模型时才安装；Web 首次启动本地模型会执行等价任务
+uv sync --extra local-models
 ```
+
+Web 地址为 `http://127.0.0.1:8765/`，可管理知识库、每库向量开关、索引任务、提案和向量模型。手工或 IDE 修改文档后，watcher 会发现变化：`filesystem` 模式直接入队；`git-object` 模式先显示 `dirty/waiting_commit`，提交后由 hook 或定时对账入队，不会把未提交内容混入主分支索引。
 
 最小可用配置：
 
@@ -115,6 +125,7 @@ knowledge_bases:
     repo: D:/code/kb-standards
     default_authority: contract
     default_write: read_only
+    vector_enabled: true             # 每库开关；false 时仅 BM25
 
   - kb_id: knowledge-base-mcp        # 本项目（内嵌 knowledge/）
     source_type: embedded
@@ -124,6 +135,7 @@ knowledge_bases:
     index_ref: main
     default_authority: note
     default_write: proposal_only
+    vector_enabled: true
     prefix_rules:
       - glob: "knowledge/spec/**"
         authority: contract         # 冻结设计 = 契约
@@ -137,12 +149,12 @@ knowledge_bases:
 
 | 阶段 | 范围 | 验收 |
 |---|---|---|
-| **P0** | registry 解析 + Markdown 解析分块 + LanceDB 索引 + `kb_search`/`kb_read`/`kb_list`（stdio） | 在 Cursor 里能检索到本项目 `knowledge/spec/` 的文档，结果带路径与 commit 溯源 |
-| **P1** | BM25 + RRF + front matter 过滤 + 表格/代码块专项处理 | 搜单个字段名能命中映射表那一行 |
-| **P2** | embedded 库的 git-object 索引 + post-merge 增量 + worktree ref 隔离 | 改了 `knowledge/` 合并后 30 秒内可检索 |
-| **P3** | 提案队列 + base_version 校验 + 审计 | 两个 Worker 同时提案同一文件，后者标 stale 而非覆盖 |
+| **P0** | uv 项目 + registry + Markdown 分块 + LanceDB + `kb_search`/`kb_read`/`kb_list` + `kb_init_guide` | Cursor 能检索并溯源；其他项目仅凭工具即可获得完整建库清单 |
+| **P1** | BM25 + RRF + front matter 过滤 + 每库 `vector_enabled` 与明确降级 | 搜字段命中映射行；关闭向量仍可 BM25 检索且不产生向量任务 |
+| **P2** | git-object + watcher + hook + 定时对账 + SQLite 持久化队列 + Web 索引状态 | 提交后 30 秒内入队；重复事件幂等；hook 缺失可收敛；重启恢复任务 |
+| **P3** | 提案 + base_version + 审计 + Web 知识库配置与提案 diff 审查 | 并发提案后者标 stale；Web 不能批准 stale，可新增和配置知识库 |
 | **P4** | Orchestrator：DAG 引擎 + worktree 分配 + 三个 Adapter + 黑板 + 冲突检测 | 三个异构 Worker 并行跑不同任务，产物可合并 |
-| **P5** | 产出自动归档 + ADR 模板 + `kb_stat` + 图片 caption | 完整跑通"检索 → 开发 → 归档 → 再检索命中上次记录" |
+| **P5** | Web 线上/本地模型管理、按需 local-models、模型代次切换 + 产出归档/ADR/图片 caption | 基础安装无 ML 依赖；本地模型全程可观测；切换不混维度；知识流转闭环可运行 |
 
 ---
 
@@ -152,8 +164,8 @@ knowledge_bases:
 
 | 文档 | 内容 |
 |---|---|
-| [knowledge/spec/01-多Agent共享知识库架构.md](knowledge/spec/01-多Agent共享知识库架构.md) | 架构总览、四层映射（仓库/kb/分区/文档）、Registry 最小化配置、MCP 接口、检索链路、黑板表结构与并发控制、调度与 worktree、提案闭环、工程结构、部署、风险清单、与 TencentDB/Dify/Munder Difflin 的对比 |
-| [knowledge/spec/02-Branch与Worktree与内嵌知识库.md](knowledge/spec/02-Branch与Worktree与内嵌知识库.md) | branch 与 worktree 的区别、为什么索引要建在 Git 对象库上、三种 ref 语义与授权矩阵、post-merge hook、四种典型场景走查、反模式清单 |
+| [knowledge/spec/01-多Agent共享知识库架构.md](knowledge/spec/01-多Agent共享知识库架构.md) | 架构与四层映射、Registry、7 个 MCP 工具、持久化队列、检索降级、Web 知识库/索引/提案/模型管理、uv 可选依赖、黑板与调度、工程部署和风险清单 |
+| [knowledge/spec/02-Branch与Worktree与内嵌知识库.md](knowledge/spec/02-Branch与Worktree与内嵌知识库.md) | branch 与 worktree、Git 对象索引、ref 授权、watcher/hook/轮询对账、未提交变更处理、异步 hook、五种典型场景与反模式 |
 
 ---
 
