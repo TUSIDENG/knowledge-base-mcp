@@ -1,0 +1,30 @@
+version: 1
+embedding:
+  active_profile: builtin-hash
+  profiles:
+    - profile_id: builtin-hash
+      type: builtin          # 仅离线冒烟；生产改成 online 或 local
+      dim: 512
+      batch_size: 32
+storage:
+  lancedb_path: ../.kb-data/lance
+  sqlite_path: ../.kb-data/meta.db
+knowledge_bases:
+  - kb_id: knowledge-base-mcp
+    display_name: 多 Agent 共享知识库
+    source_type: embedded
+    repo: ..
+    knowledge_root: knowledge
+    index_mode: git-object
+    index_ref: master
+    serve_refs: [master]
+    default_authority: note
+    default_write: "no"
+    vector_enabled: true
+    include: ["**/*.md"]
+    exclude: ["**/.obsidian/**", "**/.trash/**"]
+    prefix_rules:
+      - glob: knowledge/spec/**
+        authority: contract
+      - glob: knowledge/adr/**
+        authority: frozen

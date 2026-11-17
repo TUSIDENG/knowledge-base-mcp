@@ -2,7 +2,7 @@
 
 > 自建的多 Agent 共享知识库网关。用一套 MCP 协议，让 Cursor / Codex / OpenCode / Gemini 这些编码 Agent 共用同一份项目知识，并可单 Agent 直连开发、或由现成调度 Agent（OpenCode / Claude Code 原生 subagent）编排多个子代理并行开发。
 
-**当前状态：设计阶段（P0 未开工）**。仓库里目前只有两份冻结的设计文档，代码尚未落地。接口、配置、表结构都已在文档中定稿，可直接照做实现。
+**当前状态：P0 已实现**。包含 uv 工程、`kb_registry.yaml` 解析、Markdown 解析分块、LanceDB 索引，以及 `kb_init_guide` / `kb_list` / `kb_search` / `kb_read` 四个 MCP 工具与 CLI。P1 起的 BM25、watcher、持久化队列、Web 管理面和提案尚未实现，设计见 `knowledge/spec/`。
 
 ---
 
@@ -91,29 +91,33 @@ knowledge-base-mcp/
 
 ---
 
-## 快速开始（P0，尚未实现）
+## 快速开始（P0）
 
 ```bash
-# 1. 基础安装（使用线上向量模型；不安装本地机器学习依赖）
+# 1. 基础安装（使用线上向量模型或内置占位模型；不安装本地机器学习依赖）
 uv sync
 
-# 2. 注册本仓库自身为知识库（其他项目可先调用 kb_init_guide 获取清单）
-uv run kb-gateway kb add --id knowledge-base-mcp --source-type embedded --repo . --knowledge-root knowledge
+# 2. 注册知识库（本仓库已预置 config/kb_registry.yaml，其他项目可用 kb_init_guide 获取清单）
+uv run kb-gateway kb add --config config/kb_registry.yaml --id demo --source-type external --repo D:/code/kb-demo --knowledge-root knowledge
 
-# 3. 在终端一启动 HTTP 单实例（MCP + Web + watcher + 持久化队列消费者）
-uv run kb-gateway serve --transport http --host 127.0.0.1 --port 8765 --watch
+# 3. 构建索引（默认增量；--full 忽略内容哈希全量重建）
+uv run kb-gateway reindex --config config/kb_registry.yaml --kb knowledge-base-mcp --full
 
-# 4. 在终端二触发首次索引（异步入队；也可在 Web 点击重建）
-uv run kb-gateway reindex --kb knowledge-base-mcp --ref main --full --progress
+# 4. 查看索引状态与分区
+uv run kb-gateway list --config config/kb_registry.yaml --prefixes
 
-# 5. 接入 Cursor / Codex / OpenCode / Gemini 并检查
-uv run kb-gateway doctor --agent cursor-main
+# 5. 启动 MCP 服务（常驻 HTTP，客户端用 url 连接 http://127.0.0.1:8787/mcp）
+uv run kb-gateway serve --config config/kb_registry.yaml --transport streamable-http --host 127.0.0.1 --port 8787
 
-# 仅当准备运行本地模型时才安装；Web 首次启动本地模型会执行等价任务
+#   由客户端拉起进程时改用：--transport stdio
+
+# 仅当准备运行本地向量模型时才安装；纯线上模式不需要
 uv sync --extra local-models
 ```
 
-Web 地址为 `http://127.0.0.1:8765/`，可管理知识库、每库向量开关、索引任务、提案和向量模型。手工或 IDE 修改文档后，watcher 会发现变化：`filesystem` 模式直接入队；`git-object` 模式先显示 `dirty/waiting_commit`，提交后由 hook 或定时对账入队，不会把未提交内容混入主分支索引。
+P0 只做向量检索：`kb_search` 的 `effective_mode` 恒为 `vector`，请求 `hybrid`/`bm25` 会返回 `degraded_reason`。向量化默认使用 `type: builtin` 的离线哈希占位模型，仅用于冒烟，生产请配置 `online` 或 `local`；关闭 `vector_enabled` 的库在 P0 暂不可检索。
+
+> P1+ 待实现：BM25 + RRF、watcher 与 Git hook、SQLite 持久化队列、HTTP 单实例与 Web 管理面（`http://127.0.0.1:8765/`，知识库/向量模型/索引进度/提案审查）、`kb_stat` 与 `doctor`。
 
 最小可用配置：
 
