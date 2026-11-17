@@ -1,6 +1,6 @@
 # knowledge-base-mcp
 
-> 自建的多 Agent 共享知识库网关。用一套 MCP 协议，让 Cursor / Codex / OpenCode / Gemini 这些编码 Agent 共用同一份项目知识，并可单 Agent 直连开发、或由调度 Agent 编排多个 Worker 并行开发。
+> 自建的多 Agent 共享知识库网关。用一套 MCP 协议，让 Cursor / Codex / OpenCode / Gemini 这些编码 Agent 共用同一份项目知识，并可单 Agent 直连开发、或由现成调度 Agent（OpenCode / Claude Code 原生 subagent）编排多个子代理并行开发。
 
 **当前状态：设计阶段（P0 未开工）**。仓库里目前只有两份冻结的设计文档，代码尚未落地。接口、配置、表结构都已在文档中定稿，可直接照做实现。
 
@@ -51,7 +51,7 @@
 ```
 Worker(codex/opencode/gemini) ──MCP──▶ KB Gateway ──▶ 存储
      ↑                              ↑        ↑
- Orchestrator(可选)                 │        └─ Watcher / Git Hook / 定时对账
+ 调度 Agent(现成,可选)              │        └─ Watcher / Git Hook / 定时对账
                               Web 管理 UI + /api
 ```
 
@@ -82,8 +82,8 @@ knowledge-base-mcp/
 └── (待建) 代码目录
     ├── pyproject.toml + uv.lock   # uv 项目；local-models 为可选 extra
     ├── kb_gateway/               # MCP + Web：registry / parser / indexer.queue / search / proposal / models
-    ├── orchestrator/             # 调度层（可选启用）：planner / scheduler / dispatcher / blackboard / merger
-    ├── workers/                  # WorkerAdapter + codex/opencode/gemini 三个适配器
+    ├── orchestrator/             # 薄层编排（不自研 DAG）：worktree / blackboard / artifacts / merger
+    ├── workers/                  # WorkerAdapter + codex/opencode/gemini/claude 适配器
     └── config/                   # kb_registry.yaml / agent_grants.yaml / orchestrator.yaml
 ```
 
@@ -153,7 +153,7 @@ knowledge_bases:
 | **P1** | BM25 + RRF + front matter 过滤 + 每库 `vector_enabled` 与明确降级 | 搜字段命中映射行；关闭向量仍可 BM25 检索且不产生向量任务 |
 | **P2** | git-object + watcher + hook + 定时对账 + SQLite 持久化队列 + Web 索引状态 | 提交后 30 秒内入队；重复事件幂等；hook 缺失可收敛；重启恢复任务 |
 | **P3** | 提案 + base_version + 审计 + Web 知识库配置与提案 diff 审查 | 并发提案后者标 stale；Web 不能批准 stale，可新增和配置知识库 |
-| **P4** | Orchestrator：DAG 引擎 + worktree 分配 + 三个 Adapter + 黑板 + 冲突检测 | 三个异构 Worker 并行跑不同任务，产物可合并 |
+| **P4** | 现成 Agent 作调度器（OpenCode / Claude Code 原生 subagent）+ worktree 分配 + 黑板 + 产物合并 | 调度 Agent 自行拆解并派发子代理，各自在独立 worktree 工作，产物可合并 |
 | **P5** | Web 线上/本地模型管理、按需 local-models、模型代次切换 + 产出归档/ADR/图片 caption | 基础安装无 ML 依赖；本地模型全程可观测；切换不混维度；知识流转闭环可运行 |
 
 ---

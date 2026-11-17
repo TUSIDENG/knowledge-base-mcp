@@ -4,14 +4,14 @@ systems: [git, kb-gateway]
 doc_type: guide
 status: frozen
 owner: david
-version: 1.1
+version: 1.2
 related: [spec/01-多Agent共享知识库架构.md]
 ---
 # Branch + Worktree 与内嵌知识库的搭配使用指南
 
 > 配套文档：《多 Agent 并发开发 · 共享知识库架构设计》
 > 本文只解决一个问题：**当知识库的物理载体是项目仓库里的 `knowledge/` 目录时，多分支并行开发下它该怎么索引、怎么检索、怎么避免读到错误的版本。**
-> 版本：v1.1（增加持久化队列、手工变更感知与 Web 索引状态）
+> 版本：v1.2（调度方改为现成 Agent，worktree 由薄层分配）
 
 ---
 
@@ -158,7 +158,7 @@ ref: working:<task_id>       # 本分支未提交草稿：只有该 worktree 的
 |---|---|---|---|
 | 主工作区（你本人 / 审查 Agent） | `main` | 任意已提交 ref | — |
 | worktree 内的 Worker | **`main`** | 自己的 `feature/*` 和自己的 `working:*` | 其他分支的 `feature/*`、其他 worktree 的 `working:*` |
-| 调度 Agent（Orchestrator） | `main` | 任务 DAG 中显式声明的 ref | `working:*`（草稿不进调度视野） |
+| 调度 Agent（现成 Agent，如 OpenCode / Claude Code） | `main` | 任务清单中显式声明的 ref | `working:*`（草稿不进调度视野） |
 
 **为什么 Worker 默认读 main 而不是自己的分支分支？**
 
@@ -306,11 +306,11 @@ knowledge_bases:
 
 ### 场景 B：多 Agent 并行特性开发（worktree 隔离）
 ```
-Orchestrator 派发 T1/T2/T3
-→ git worktree add .worktrees/w-t1 -b feature/oms-sync
-→ Worker A 在 w-t1 内开发，kb 检索默认 ref=main
+调度 Agent（现成）派发 T1/T2/T3 子代理
+→ kb-gateway worktree add --task w-t1（内部 git worktree add .worktrees/w-t1 -b feature/oms-sync）
+→ 子代理在 w-t1 内开发，kb 检索默认 ref=main
 → A 改了自己分支的 knowledge → 只能通过 ref=working:w-t1 自己看到
-→ A 提交 feature/oms-sync → Orchestrator 登记该 ref（可选）
+→ A 提交 feature/oms-sync → 薄层登记该 ref（可选）
 → 合并进 main → post-merge 异步入队 → 任务成功后全场可见
 ```
 

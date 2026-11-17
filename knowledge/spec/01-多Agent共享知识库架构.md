@@ -4,12 +4,12 @@ systems: [kb-gateway]
 doc_type: rfc
 status: frozen
 owner: david
-version: 1.2
+version: 1.3
 related: [spec/02-Branch与Worktree与内嵌知识库.md]
 ---
 # 多 Agent 并发开发 · 共享知识库架构设计
 
-> 版本：v1.2（自建方案 · 增加初始化指导、持久化索引队列、Web 管理与按需模型运行时）
+> 版本：v1.3（模式二改为现成 Agent 调度 + 薄层编排，不再自研 DAG 引擎）
 > 适用场景：个人 / 小团队，维护多个独立项目（如 ERP 中台 + OMS + RPS + PDM），需要多个编码 Agent 各自开发或由一个调度 Agent 统一编排并行开发，所有 Agent 共享同一套项目知识库。
 > 配套文档：《Branch + Worktree 与内嵌知识库搭配使用指南》
 
@@ -24,7 +24,7 @@ related: [spec/02-Branch与Worktree与内嵌知识库.md]
 | G1 | 知识库共享 | 任意数量的 Agent（含并行运行的）可同时读到同一份知识，检索结果一致、权限一致 |
 | G2 | 知识库物理位置灵活 | 既能是独立的专门知识库目录（标准性资产），也能是某个项目仓库内部的 `knowledge/` 目录，对 Agent 完全透明 |
 | G3 | 库内隔离 | 一个仓库 = 一个 `kb_id`，库内用目录前缀分区，检索可精确限定到某个/某几个分区，默认不串区 |
-| G4 | 两种开发模式 | 模式一：单 Agent 直连知识库+仓库自行开发；模式二：调度 Agent 拆任务、并发派发、汇总 |
+| G4 | 两种开发模式 | 模式一：单 Agent 直连知识库+仓库自行开发；模式二：用现成 Agent（OpenCode / Claude Code 等）作调度器拆任务并派发子代理，项目只提供 worktree、黑板与合并薄层 |
 | G5 | 并发安全 | 多个 Agent 并行改代码不互相覆盖；并行写知识库不产生脏数据 |
 | G6 | 产出回流 | Agent 开发产出（方案、SQL、脚本、决策记录）可沉淀回知识库，且不污染已冻结的契约 |
 | G7 | 增量更新 | 知识库文档新增/修改后，无需人工全量重建即可被检索到 |
@@ -63,15 +63,16 @@ related: [spec/02-Branch与Worktree与内嵌知识库.md]
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                          使用者（你 / IDE / CLI）                          │
 └───────────────┬──────────────────────────────────────┬───────────────────┘
-                │ 模式一：单 Agent 直连                 │ 模式二：调度指令
+                │ 模式一：单 Agent 直连                 │ 模式二：现成 Agent 调度
                 ▼                                      ▼
 ┌──────────────────────────────┐        ┌──────────────────────────────────┐
-│  Worker Agent（单一开发者）   │        │  Orchestrator（调度 Agent）       │
-│  Codex / OpenCode / Gemini    │        │  · 需求→任务 DAG 拆解             │
-│  或 IDE 内 Agent              │        │  · Worker 选型与并发派发          │
-│                               │        │  · 黑板仲裁 / 结果合并 / 冲突检测 │
+│  Worker Agent（单一开发者）   │        │  调度 Agent（现成，非自研）        │
+│  Codex / OpenCode / Gemini    │        │  OpenCode / Claude Code 等        │
+│  或 IDE 内 Agent              │        │  · 需求→任务拆解（Agent 原生）     │
+│                               │        │  · subagent 并发派发（Agent 原生） │
+│                               │        │  · 薄层：worktree/黑板/合并        │
 └──────┬───────────────────────┘        └───────┬──────────────────────────┘
-       │                                        │ spawn / 回收
+       │                                        │ subagent（各自绑定 worktree）
        │                          ┌─────────────┼─────────────┬────────────┐
        │                          ▼             ▼             ▼            ▼
        │                    ┌─────────┐   ┌─────────┐   ┌─────────┐  ┌─────────┐
@@ -547,13 +548,13 @@ env = { KB_CONFIG = "/home/david/.kb-gateway/kb_registry.yaml", KB_AGENT_ID = "c
 
 ### 5.1 统一 Worker Adapter
 
-三种 CLI Agent 的调用方式差异很大（参数、会话保持、输出格式），用一个薄适配层吸收：
+各 CLI Agent 的调用方式差异很大（参数、会话保持、输出格式），用一个薄适配层吸收。**子代理能力由 Agent 原生提供，适配层只负责非交互调用与产物回收**：OpenCode 用 `mode: subagent` 定义子代理并由主代理经 `subagent` 工具派发；Claude Code 用 `.claude/agents/*.md` 定义并经 Task 工具派发。本项目不实现任务拆解器和派发器。
 
 ```python
 # workers/base.py —— 伪代码，示意接口契约
 class WorkerAdapter(Protocol):
     agent_id: str
-    backend: Literal["codex", "opencode", "gemini"]
+    backend: Literal["codex", "opencode", "gemini", "claude"]
 
     def prepare(self, task: Task, worktree: Path) -> None:
         """注入任务规则文件（AGENTS.md / CLAUDE.md 等），声明本任务的 (kb_id, prefixes) 授权"""
@@ -570,8 +571,9 @@ class WorkerAdapter(Protocol):
 | `CodexAdapter` | `codex exec --cwd <worktree> "<prompt>"` 或 exec 模式读 stdin | 需 `--full-auto` 或按需审批；超时必须 `SIGTERM` 后回收子进程组 |
 | `OpenCodeAdapter` | `opencode run --dir <worktree>` | BYOK，模型走代理时注意 `baseURL` 指向 |
 | `GeminiAdapter` | `gemini -p "<prompt>" --cwd` | 上下文窗口大，适合前端/长文档任务 |
+| `ClaudeCodeAdapter` | `claude -p "<prompt>" --output-format stream-json` | 原生 subagent（`.claude/agents/*.md` + Task 工具），适合直接充当调度器 |
 
-三个 Adapter 共享同一套 `Task` 结构，**Worker 的差别只体现在后端能力和成本，不影响调度逻辑**。这也是异构并行能成立的原因。
+四个 Adapter 共享同一套 `Task` 结构，**Worker 的差别只体现在后端能力和成本，不影响调度逻辑**。这也是异构并行能成立的原因。
 
 ### 5.2 模式一：单 Agent 直连
 
@@ -590,20 +592,38 @@ class WorkerAdapter(Protocol):
 
 **这种方式下 KB Gateway 就是"外挂长期记忆"**，Agent 的上下文窗口多大都不重要，因为它可以在任何一轮重新检索。
 
-### 5.3 模式二：调度 Agent 并行
+### 5.3 模式二：现成 Agent 调度 + 薄层编排
 
 ```
-你 ──需求──▶ Orchestrator
+你 ──需求──▶ 调度 Agent（OpenCode / Claude Code 等现成 Agent）
                  │
-                 ├─ 1. 需求解析 → 任务 DAG（节点=子任务，边=依赖）
-                 ├─ 2. 节点绑定：backend 选型 + (kb_id, prefixes) 授权 + 是否需 worktree
-                 ├─ 3. 无依赖节点并发派发（并发上限 N，建议 3~4）
-                 ├─ 4. 回收结果 → 黑板写入 → 冲突检测
-                 ├─ 5. 依赖节点解阻 → 下一批派发
-                 └─ 6. 全部完成 → 合并 diff → 汇总报告 → 产出提案
+                 ├─ 1. 需求解析 → 任务清单（Agent 原生能力，不强制严格 DAG）
+                 ├─ 2. 为每个任务准备 worktree，并注入 (kb_id, prefixes) 授权
+                 ├─ 3. 通过 subagent 并发派发子代理（并发数由 Agent 与人数配置控制）
+                 ├─ 4. 子代理写黑板契约，或在各自 worktree 直接产出
+                 ├─ 5. 调度 Agent 汇总 diff → 冲突检测 → 产出提案
+                 └─ 6. 你审查提案；合并后由索引队列回流知识库
 ```
 
-**任务 DAG 节点结构：**
+**不需要为"拆任务 + 派发"新增本项目功能。** OpenCode 原生支持 `mode: subagent` 子代理，主代理可经 `subagent` 工具在前台/后台子会话中派发；Claude Code 原生支持 `.claude/agents/*.md` 子代理，经 Task 工具派发并拥有独立上下文窗口。本项目只提供 MCP 知识库工具，以及下面三件薄层能力：
+
+- **worktree 生命周期**：子代理默认共享会话的工作目录，不能假设它自带隔离，必须由薄层先建好 worktree 再告知子代理路径。
+- **黑板**：跨子代理传递数据契约，不依赖会话上下文，也不会因上下文裁剪丢失。
+- **产物收集与合并**：按 worktree 分支取 diff，冲突回退给对应子代理重做。
+
+| 后端 | 原生调度能力 | 薄层需要补充 |
+|---|---|---|
+| OpenCode | `agents.<name>.mode: subagent`，主代理经 `subagent` 工具派发，支持前台/后台子会话与子代理权限 | worktree 隔离、黑板、产物收集；子代理共享 cwd |
+| Claude Code | `.claude/agents/*.md` + Task 工具，子代理独立上下文与工具集 | 同上 |
+| Codex / Gemini CLI | 无原生子代理派发 | 需要外层脚本并发起多个进程；单任务场景无需薄层 |
+
+**"换模型"不等于"换 Agent 产品"。** OpenCode 子代理的 `model` 采用 `provider/model` 形式，可混用 Anthropic、OpenAI、Gemini 或本地 OpenAI 兼容模型，但仍在 OpenCode 运行时内执行；Claude Code 子代理的 `model` 只接受 `sonnet` / `opus` / `haiku` / `inherit`，即只能选 Claude 系列。两者都**不能**把 Codex CLI、Gemini CLI 当作原生子代理——只能通过 Shell 调用对方 CLI（`codex exec` / `gemini -p`），属于嵌套子进程而非原生 subagent。需要跨产品混编时，仍由薄层统一派发各 CLI 进程 + worktree。
+
+另外，Claude Code 子代理不能再派生子代理，OpenCode 的 `general` 子代理同样不能再派，防止无限嵌套；超过一层的并行编排必须由薄层分层派发。
+
+**非确定性提醒：** 子代理派发由模型决定，顺序与并发数不保证可复现。需要固定 DAG 的批量流水线（如夜间全量生成）仍建议用薄层顺序执行或外部脚本，而不是依赖 Agent 自主规划。
+
+**任务清单示例（作为调度提示词或 `AGENTS.md` 的输入，不是自研引擎的内部结构）：**
 
 ```yaml
 - id: T1
@@ -640,10 +660,11 @@ class WorkerAdapter(Protocol):
 ### 5.4 并发隔离：worktree 生命周期
 
 ```
-派发前：  git -C <repo> worktree add .worktrees/w-<task_id> -b agent/<task_id>
+派发前：  kb-gateway worktree add --task <task_id>
+          （内部执行 git worktree add .worktrees/w-<task_id> -b agent/<task_id>，再把路径告知子代理）
 执行中：  Worker 独占该目录，读写自由，不碰主工作区
 回收后：  产物 diff 存 artifact 表 → worktree 保留（供人工审查）或按策略清理
-合并时：  Orchestrator 按 DAG 拓扑顺序做三方合并；冲突则回退给对应 Worker 重做
+合并时：  调度 Agent 按依赖顺序做三方合并；冲突则回退给对应子代理重做
 ```
 
 **为什么必须是 worktree 而不是同目录 + 锁：**
@@ -698,7 +719,7 @@ CREATE TABLE blackboard_lease (
     PRIMARY KEY (run_id, key)
 );
 
--- 冲突记录：同 key 多版本且内容不一致时由 Orchestrator 登记
+-- 冲突记录：同 key 多版本且内容不一致时由调度 Agent（或薄层）登记
 CREATE TABLE blackboard_conflict (
     conflict_id  INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id       TEXT NOT NULL,
@@ -722,7 +743,7 @@ CREATE UNIQUE INDEX idx_lease_holder ON blackboard_lease(run_id, holder_agent);
 
 1. `UNIQUE (run_id, key, version)` 而不是 `UNIQUE (run_id, key)` —— 允许同 key 并存多版本，冲突不是靠"锁死"而是靠"并存 + 事后仲裁"，这在异构 Agent 并行时更实际（你无法预先知道会不会撞）。
 2. `blackboard_lease` 带 `expires_at` —— Worker 崩溃/超时后租约自动失效，避免整个调度被一个挂掉的 Agent 卡死。这是黑板模式最容易踩的坑。
-3. `blackboard_access` 记录 `read_version` —— 若一个 Worker 读了 v1，而 v2 已出现，Orchestrator 能识别出"它基于过期信息开发"，主动要求重跑。
+3. `blackboard_access` 记录 `read_version` —— 若一个 Worker 读了 v1，而 v2 已出现，调度 Agent / 薄层能识别出"它基于过期信息开发"，主动要求重跑。
 
 ### 6.2 通信模型对比
 
@@ -731,32 +752,33 @@ CREATE UNIQUE INDEX idx_lease_holder ON blackboard_lease(run_id, holder_agent);
 | 点对点直连（Agent 互调） | ❌ 三种 CLI 无法互相建立会话 | 高（A 等 B，B 等 A） | 高 | 难 | 不可行 |
 | 消息队列（每个 Agent 一个 inbox） | 中（需为每种 CLI 包装轮询机制） | 中 | 中 | 中 | 包装成本高 |
 | **共享黑板（读写代 key）** | ✅ 只需 MCP 4 个工具 | 低（租约超时兜底） | 低（按 key 隔离） | 高（全量表记录） | **采用** |
-| LangGraph State（框架内共享） | ✅ 但绑定框架 | 低 | 低 | 中 | 作为 Orchestrator 内部实现，不对外 |
+| LangGraph State（框架内共享） | ✅ 但绑定框架 | 低 | 低 | 中 | 作为薄层内部实现，不对外 |
 
-**注意**：黑板是 **Orchestrator 提供给 Worker 的共享存储**，不是 Worker 之间的实时对话通道。Worker 只在"开始前读入"和"完成后写出"两个时点接触黑板。这个约束看起来降低了通信能力，实际上正是它让异构 Agent 并行可用的原因——异构建模无法支持实时对话。
+**注意**：黑板是 **调度方（现成 Agent + 薄层）提供给 Worker 的共享存储**，不是 Worker 之间的实时对话通道。Worker 只在"开始前读入"和"完成后写出"两个时点接触黑板。这个约束看起来降低了通信能力，实际上正是它让异构 Agent 并行可用的原因——异构建模无法支持实时对话。
 
 ---
 
-## 7. 编排层：自建 vs 借用
+## 7. 编排层：现成 Agent vs 自建
 
-| 维度 | 纯自建（Python asyncio） | LangGraph | 现成成品（Munder Difflin 等） |
+| 维度 | 现成 Agent 原生调度（默认） | 纯自建（Python asyncio） | LangGraph |
 |---|---|---|---|
-| DAG 依赖控制 | 完全自主，代码可控 | 原生支持，`Send` 并行 | 依赖 Agent 规划，不可控 |
-| 异构 Worker 调用 | 完全自主 | 通过自定义节点 | 需按其规则适配 |
-| 黑板共享 | 直接复用第 6 章 SQLite | 需与 State 分离，两套状态 | 内置但不开放 |
-| 人工卡点 / 重试 / 并发上限 | 需自己实现 | 需自己实现（原生较弱） | 部分内置 |
-| 可观测性 | 需自建（简单日志即可） | LangSmith | 自带 UI |
-| 学习/维护成本 | 中（约 300~500 行核心代码） | 中 | 低（但黑盒） |
-| 适配你的场景 | ✅ 推荐 | ✅ 可选 | ⚠️ 只适合验证，不适合长期 |
+| 任务拆解与派发 | Agent 原生 subagent，零代码 | 需自写 planner + scheduler | 需自写节点 |
+| 异构后端切换 | 换 Agent 或换子代理配置 | 完全自主 | 通过自定义节点 |
+| 顺序 × 并发确定性 | 弱，由模型决定 | 强 | 强 |
+| 并发上限 / 超时 | 由 Agent 配置与权限控制，粒度较粗 | 精确控制 | 中等 |
+| 黑板共享 | 复用第 6 章 SQLite | 同 | 需与 State 分离 |
+| worktree 隔离 | 需薄层先建目录再告知子代理 | 自主 | 自主 |
+| 学习 / 维护成本 | 低 | 中（约 300~500 行） | 中 |
+| 适配结论 | ✅ 默认采用 | 仅固定流水线时 | 可选 |
 
-**建议**：Orchestrator 用 `asyncio + 一个 200 行的 DAG 引擎`自建。理由不是"炫技"，而是你的场景有 4 个现成框架都给不了的东西：
+**建议**：默认由现成 Agent 担任调度器（优选 OpenCode，Claude Code 亦可），本项目不写 planner/scheduler，只保留薄层。原来自建方案要解决的四个边界问题，现在归属如下：
 
-1. 三种异构 CLI 的超时/杀进程组语义各不相同，必须自己控
-2. 黑板要和知识库提案队列打通（Worker 产出→黑板→提案→KB 归档）
-3. 每个任务要绑定不同的 `(kb_id, 前缀)` 授权范围
-4. worktree 生命周期要精确控制（保留供审查 vs 清理）
+1. 子进程超时与进程组回收 —— 由 Agent 自身管理；薄层只负责自己 spawn 的进程
+2. 黑板与提案队列打通（产出 → 黑板 → 提案 → KB 归档）—— 仍是薄层职责
+3. 每个任务绑定不同的 `(kb_id, 前缀)` 授权 —— 由薄层注入规则文件
+4. worktree 生命周期（保留供审查 vs 清理）—— 由薄层 `kb-gateway worktree` 管理
 
-这四点都发生在框架的"边界外"，框架只能包住 DAG 本身，收益不大但增加一层抽象。
+只有需要**固定、可复现的 DAG**（如夜间批量生成）才退回薄层顺序执行或外部脚本；这类场景不需要重写通用 planner。
 
 ---
 
@@ -888,17 +910,15 @@ kb-dev-system/
 │   ├── proposal.py                 # 提案队列、base_version 校验、归档
 │   └── audit.py                    # 审计日志
 │
-├── orchestrator/                   # 调度层（可选启用）
-│   ├── planner.py                  # 需求 → 任务 DAG
-│   ├── scheduler.py                # asyncio DAG 引擎、并发上限、超时
-│   ├── dispatcher.py               # worktree 分配 + Worker 派发
+├── orchestrator/                   # 薄层编排（不自研 planner / DAG 引擎）
+│   ├── worktree.py                 # worktree 分配与回收，供调度 Agent 调用
 │   ├── blackboard.py               # 第 6 章 SQLite 实现
-│   ├── merger.py                   # 产物合并、冲突检测
-│   └── reporter.py                 # 汇总报告 + 产出提案
+│   ├── artifacts.py                # 按 worktree 分支收集子代理产物
+│   └── merger.py                   # 产物合并、冲突检测
 │
 ├── workers/
 │   ├── base.py                     # WorkerAdapter 协议
-│   ├── codex.py / opencode.py / gemini.py
+│   ├── codex.py / opencode.py / gemini.py / claude.py
 │   └── rules/                      # 各后端注入的规则模板（含 kb + prefixes 声明）
 │
 ├── config/
@@ -989,7 +1009,7 @@ uv sync --extra local-models
 | **P1 混合检索** | BM25 + RRF + front matter 过滤 + 每库 `vector_enabled` 与明确降级 | 2 天 | 精确字段命中映射行；关闭向量后仍可 BM25 检索且不产生向量任务 |
 | **P2 双形态与队列** | embedded 库 + git hook + watcher + 定时对账 + SQLite 持久化队列 + Web 索引状态 | 1~2 天 | 提交后 30 秒内入队可检索；重复事件幂等；hook 缺失可收敛；重启任务恢复 |
 | **P3 共享写与 Web** | proposal + base_version + 审计 + Web 知识库配置/提案 diff 审查 | 2 天 | 并发提案后者标 stale；Web 可新增配置知识库且不能批准 stale 提案 |
-| **P4 并发编排** | Orchestrator：DAG 引擎 + worktree 分配 + 三个 Adapter + 黑板 + 合并冲突检测 | 3~5 天 | 三个异构 Worker 并行跑不同任务，产物可合并，黑板数据正确传递 |
+| **P4 调度与薄层** | 现成 Agent 作调度器（OpenCode / Claude Code 原生 subagent）+ worktree 分配 + 黑板 + 产物合并 | 2~3 天 | 调度 Agent 自行拆解并派发子代理，各自在独立 worktree 工作，产物可合并、黑板数据正确传递 |
 | **P5 模型与闭环增强** | Web 线上/本地模型管理、按需 local-models、模型代次切换 + 产出归档/ADR/图片 caption | 2 天 | 基础安装无 ML 依赖；本地安装下载运行可观测；模型切换不混维度；知识流转闭环可运行 |
 
 **建议严格按 P0→P5 推进，每个阶段结束你都应该能实际用起来。** 不要一次把 P4 的编排写完再回头调检索——检索质量不到位时，并行 Worker 只会更快地产出错误代码。

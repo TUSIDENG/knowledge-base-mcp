@@ -3,7 +3,7 @@ domain: [kb-gateway]
 doc_type: guide
 status: frozen
 owner: david
-version: 1.1
+version: 1.2
 ---
 
 # knowledge-base-mcp · 知识库入口
@@ -23,8 +23,8 @@ version: 1.1
 
 | 文档 | 说明 | 状态 |
 |---|---|---|
-| [spec/01-多Agent共享知识库架构.md](spec/01-多Agent共享知识库架构.md) | 整体架构：MCP 初始化指导、持久化索引队列、Web 管理、向量开关、线上/本地模型、uv 可选依赖、黑板与提案回流 | frozen v1.2 |
-| [spec/02-Branch与Worktree与内嵌知识库.md](spec/02-Branch与Worktree与内嵌知识库.md) | Git 对象索引、ref 路由、watcher/hook/轮询对账、未提交 dirty 语义、异步入队与重启恢复 | frozen v1.1 |
+| [spec/01-多Agent共享知识库架构.md](spec/01-多Agent共享知识库架构.md) | 整体架构：MCP 初始化指导、持久化索引队列、Web 管理、向量开关、线上/本地模型、uv 可选依赖、现成 Agent 调度 + 薄层编排、黑板与提案回流 | frozen v1.3 |
+| [spec/02-Branch与Worktree与内嵌知识库.md](spec/02-Branch与Worktree与内嵌知识库.md) | Git 对象索引、ref 路由、watcher/hook/轮询对账、未提交 dirty 语义、异步入队、薄层 worktree 分配与重启恢复 | frozen v1.2 |
 
 ## 约定
 
