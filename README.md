@@ -97,16 +97,20 @@ knowledge-base-mcp/
 # 1. 基础安装（使用线上向量模型或内置占位模型；不安装本地机器学习依赖）
 uv sync
 
-# 2. 注册知识库（本仓库已预置 config/kb_registry.yaml，其他项目可用 kb_init_guide 获取清单）
+# 2. 首次使用：复制本地注册表（含本机路径，不提交 Git）
+cp config/kb_registry.example.yaml config/kb_registry.yaml
+# PowerShell：Copy-Item config/kb_registry.example.yaml config/kb_registry.yaml
+
+# 3. 按需注册其他知识库（也可用 kb_init_guide 获取清单）
 uv run kb-gateway kb add --config config/kb_registry.yaml --id demo --source-type external --repo D:/code/kb-demo --knowledge-root knowledge
 
-# 3. 构建索引（默认增量；--full 忽略内容哈希全量重建）
+# 4. 构建索引（默认增量；--full 忽略内容哈希全量重建）
 uv run kb-gateway reindex --config config/kb_registry.yaml --kb knowledge-base-mcp --full
 
-# 4. 查看索引状态与分区
+# 5. 查看索引状态与分区
 uv run kb-gateway list --config config/kb_registry.yaml --prefixes
 
-# 5. 启动 MCP 服务（常驻 HTTP，客户端用 url 连接 http://127.0.0.1:8787/mcp）
+# 6. 启动 MCP 服务（常驻 HTTP，客户端用 url 连接 http://127.0.0.1:8787/mcp）
 uv run kb-gateway serve --config config/kb_registry.yaml --transport streamable-http --host 127.0.0.1 --port 8787
 
 #   由客户端拉起进程时改用：--transport stdio

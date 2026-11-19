@@ -1,6 +1,9 @@
 # Local gateway data (LanceDB / SQLite)
 .kb-data/
 
+# Local registry (machine-specific paths); commit only the example
+config/kb_registry.yaml
+
 # Project build artifacts
 .build/
 build/
