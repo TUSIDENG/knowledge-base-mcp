@@ -57,7 +57,8 @@ Worker(codex/opencode/gemini) ──MCP──▶ KB Gateway ──▶ 存储
 
 - **KB Gateway**：单实例 MCP + Web 服务，7 个工具（`kb_init_guide` / `kb_list` / `kb_search` / `kb_read` / `kb_write_candidate` / `kb_stat` / `kb_reindex`）
 - **初始化指导**：其他项目调用 `kb_init_guide` 即可获得目录、front matter、registry、首次索引与接入清单；工具本身不写文件
-- **检索链路**：授权裁剪 → front matter 过滤 → 向量召回（每库可关闭）→ BM25 → RRF 融合 → 权威加权；向量不可用时明确降级
+- **检索链路**：授权裁剪 → front matter 过滤 → 向量召回（每库可关闭）→ 图片召回 → BM25 → RRF 融合 → 权威加权；向量不可用时明确降级
+- **图片/图表检索**：架构图、ER 图走 Chinese-CLIP 图片向量（`kb_<kb_id>__img` 独立表，与文本向量维度解耦），支持文本搜图与图搜图，caption 作为兜底
 - **索引**：committed 内容走 Git 对象库（`git show <ref>:<path>`）；watcher、hook 和定时对账统一进入 SQLite 持久化队列，支持幂等、重试和重启恢复
 - **Web 管理**：新增和配置知识库、查看队列与索引版本、审查提案 diff、管理线上/本地向量模型
 - **模型依赖**：uv 管理项目；线上模型零本地 ML 依赖，只有首次运行本地模型才安装 `local-models` extra 并下载模型
@@ -76,7 +77,7 @@ knowledge-base-mcp/
 │   ├── spec/                     # 冻结设计文档（contract 级）
 │   │   ├── 01-多Agent共享知识库架构.md
 │   │   └── 02-Branch与Worktree与内嵌知识库.md
-│   ├── decisions/                # ADR（待积累）
+│   ├── decisions/                # ADR 与选型记录
 │   └── _draft/                   # 草稿区
 │
 └── (待建) 代码目录
@@ -162,18 +163,19 @@ knowledge_bases:
 | **P2** | git-object + watcher + hook + 定时对账 + SQLite 持久化队列 + Web 索引状态 | 提交后 30 秒内入队；重复事件幂等；hook 缺失可收敛；重启恢复任务 |
 | **P3** | 提案 + base_version + 审计 + Web 知识库配置与提案 diff 审查 | 并发提案后者标 stale；Web 不能批准 stale，可新增和配置知识库 |
 | **P4** | 现成 Agent 作调度器（OpenCode / Claude Code 原生 subagent）+ worktree 分配 + 黑板 + 产物合并 | 调度 Agent 自行拆解并派发子代理，各自在独立 worktree 工作，产物可合并 |
-| **P5** | Web 线上/本地模型管理、按需 local-models、模型代次切换 + 产出归档/ADR/图片 caption | 基础安装无 ML 依赖；本地模型全程可观测；切换不混维度；知识流转闭环可运行 |
+| **P5** | Web 线上/本地模型管理、按需 local-models、模型代次切换 + 产出归档/ADR + 图片向量（架构图 / ER 图） | 基础安装无 ML 依赖；本地模型全程可观测；切换不混维度；文本与图片可分别重建；知识流转闭环可运行 |
 
 ---
 
 ## 设计文档索引
 
-两份文档是本仓库的知识源，也是实现依据：
+三份文档是本仓库的知识源，也是实现依据：
 
 | 文档 | 内容 |
 |---|---|
-| [knowledge/spec/01-多Agent共享知识库架构.md](knowledge/spec/01-多Agent共享知识库架构.md) | 架构与四层映射、Registry、7 个 MCP 工具、持久化队列、检索降级、Web 知识库/索引/提案/模型管理、uv 可选依赖、黑板与调度、工程部署和风险清单 |
+| [knowledge/spec/01-多Agent共享知识库架构.md](knowledge/spec/01-多Agent共享知识库架构.md) | 架构与四层映射、Registry、7 个 MCP 工具、持久化队列、检索降级、图片/图表向量、Web 知识库/索引/提案/模型管理、uv 可选依赖、黑板与调度、工程部署和风险清单 |
 | [knowledge/spec/02-Branch与Worktree与内嵌知识库.md](knowledge/spec/02-Branch与Worktree与内嵌知识库.md) | branch 与 worktree、Git 对象索引、ref 授权、watcher/hook/轮询对账、未提交变更处理、异步 hook、五种典型场景与反模式 |
+| [knowledge/decisions/adr-003-向量模型与向量数据库选型.md](knowledge/decisions/adr-003-向量模型与向量数据库选型.md) | 向量与向量库原理、文本/图片模型候选对比、LanceDB 选型依据与代价、容量估算与演进路线 |
 
 ---
 

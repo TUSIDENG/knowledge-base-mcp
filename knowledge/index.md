@@ -3,7 +3,7 @@ domain: [kb-gateway]
 doc_type: guide
 status: frozen
 owner: david
-version: 1.3
+version: 1.4
 ---
 
 # knowledge-base-mcp · 知识库入口
@@ -24,8 +24,9 @@ version: 1.3
 
 | 文档 | 说明 | 状态 |
 |---|---|---|
-| [spec/01-多Agent共享知识库架构.md](spec/01-多Agent共享知识库架构.md) | 整体架构：MCP 初始化指导、持久化索引队列、Web 管理、向量开关、线上/本地模型、uv 可选依赖、现成 Agent 调度 + 薄层编排、黑板与提案回流 | frozen v1.3 |
+| [spec/01-多Agent共享知识库架构.md](spec/01-多Agent共享知识库架构.md) | 整体架构：MCP 初始化指导、持久化索引队列、Web 管理、向量开关、线上/本地模型、图片与图表（架构图 / ER 图）向量、uv 可选依赖、现成 Agent 调度 + 薄层编排、黑板与提案回流 | frozen v1.4 |
 | [spec/02-Branch与Worktree与内嵌知识库.md](spec/02-Branch与Worktree与内嵌知识库.md) | Git 对象索引、ref 路由、watcher/hook/轮询对账、未提交 dirty 语义、异步入队、薄层 worktree 分配与重启恢复 | frozen v1.2 |
+| [decisions/adr-003-向量模型与向量数据库选型.md](decisions/adr-003-向量模型与向量数据库选型.md) | 向量与向量库原理（空间、度量、HNSW/IVF-PQ、pre-filter）、文本/图片模型候选对比、LanceDB 选型依据与已知代价、容量估算与演进路线 | frozen v1.0 |
 | [guides/agent-mcp-配置.md](guides/agent-mcp-配置.md) | kb-gateway 以 HTTP MCP 常驻，Cursor / Trae / Codex / OpenCode / Claude Code 的 URL 接入、单 Agent 直连与调度 Agent + 子代理用法、排错清单 | active v1.1 |
 
 ## 约定

@@ -4,12 +4,12 @@ systems: [kb-gateway]
 doc_type: rfc
 status: frozen
 owner: david
-version: 1.3
-related: [spec/02-Branch与Worktree与内嵌知识库.md]
+version: 1.4
+related: [spec/02-Branch与Worktree与内嵌知识库.md, decisions/adr-003-向量模型与向量数据库选型.md]
 ---
 # 多 Agent 并发开发 · 共享知识库架构设计
 
-> 版本：v1.3（模式二改为现成 Agent 调度 + 薄层编排，不再自研 DAG 引擎）
+> 版本：v1.4（新增图片 / 图表向量支持：文本表与图片表分离，架构图、ER 图可跨模态检索）
 > 适用场景：个人 / 小团队，维护多个独立项目（如 ERP 中台 + OMS + RPS + PDM），需要多个编码 Agent 各自开发或由一个调度 Agent 统一编排并行开发，所有 Agent 共享同一套项目知识库。
 > 配套文档：《Branch + Worktree 与内嵌知识库搭配使用指南》
 
@@ -48,7 +48,7 @@ related: [spec/02-Branch与Worktree与内嵌知识库.md]
 | 知识库服务形态 | **单实例服务（MCP + Web，stdio 可选）** | 一套 MCP 对接所有 Worker；HTTP 实例同时挂载管理 API/UI，统一管理 watcher、队列与索引写入 | 独立 Web 索引进程：会产生多写者竞争；自研 Agent REST SDK：无法复用 MCP 工具调用循环 |
 | 索引任务 | **SQLite 持久化队列** | 与元数据共用事务和备份，支持重启恢复、幂等、重试，个人场景无需额外 MQ | 内存队列：重启丢任务；独立 MQ：增加部署与运维成本 |
 | 模型运行时 | **线上 / 本地双通道，本地依赖按需安装** | 线上配置即连即用；本地模型满足离线需求，基础安装保持轻量 | 基础依赖预装 torch 等库：即使用户只用线上模型也承担大量下载 |
-| 向量存储 | **LanceDB（嵌入式，单目录）** | 零服务、单文件夹可备份、支持多表（一个 kb 一张表）、支持标量过滤 | Milvus/Qdrant 服务端：个人场景运维成本不值；Chroma：并发写弱于 LanceDB |
+| 向量存储 | **LanceDB（嵌入式，单目录）** | 零服务、单文件夹可备份、支持多表（每 kb 一张文本表 + 一张图片表，维度解耦）、支持标量过滤；同一文件格式天然能存图像向量 | Milvus/Qdrant 服务端：个人场景运维成本不值；Chroma：并发写弱于 LanceDB |
 | 元数据存储 | **SQLite（WAL 模式）** | 单文件、事务可靠、支持并发读+串行写，天然适合个人场景 | PostgreSQL：为个人知识库引入 PG 只增加了部署负担 |
 | 分块与解析 | 自建 Parser（Markdown 优先） | 必须自己控制表格、图片、代码块的处理方式，通用加载器会丢结构 | 通用文档加载库：表格被拍平、代码块被误切 |
 | 共享语义 | **共享读 + 受控写（提案制）** | 多 Agent 并发直接改契约库必然产生脏数据；契约变更必须人工确认 | 全开放读写：并行 Agent 会互相覆盖，且契约漂移无法审计 |
@@ -105,7 +105,7 @@ related: [spec/02-Branch与Worktree与内嵌知识库.md]
                ▼                                   ▼
 ┌──────────────────────────────┐   ┌───────────────────────────────────────┐
 │  KB Registry（注册表）        │   │  存储层                                │
-│  kb_registry.yaml             │   │  ├─ LanceDB：每 kb 一张表（向量+全文） │
+│  kb_registry.yaml             │   │  ├─ LanceDB：文本表 + 图片表（分维度） │
 │  · kb_id / source_type        │   │  ├─ SQLite：元数据/版本/提案/索引任务  │
 │  · repo / knowledge_root      │   │  ├─ Blackboard：SQLite 表（多 Agent 共享│
 │  · prefix_rules（目录分区）   │   │  └─ 原始文件：KB 目录本身（不复制）    │
@@ -191,7 +191,14 @@ related: [spec/02-Branch与Worktree与内嵌知识库.md]
 version: 1
 
 embedding:
-  active_profile: openai-default       # 全局唯一活动配置，切换后按代次重建向量
+  active_profile: openai-default       # 文本向量：全局唯一活动配置，切换后按代次重建
+  vision_profile: clip-zh              # 图片向量配置；置空则图片只保留 caption 文本向量
+  image:
+    enabled: true                      # 关闭后不解析图片，图片只作为普通文件忽略
+    max_size_mb: 10                    # 超过则跳过并记录，避免拖垮索引队列
+    max_edge: 2048                     # 入库前等比缩放，长边不超过该值
+    min_edge: 224                      # 小于该值的图标/装饰图不入库
+    formats: [png, jpg, jpeg, webp]    # SVG 需先栅格化，不默认支持
   profiles:
     - profile_id: openai-default
       type: online                     # 不安装任何本地机器学习依赖
@@ -207,6 +214,12 @@ embedding:
       revision: main                   # 实际使用应固定为 commit SHA
       dim: 1024
       batch_size: 16
+    - profile_id: clip-zh              # 图片向量专用，与文本 profile 相互独立
+      type: local
+      model: OFA-Sys/chinese-clip-vit-base-patch16
+      revision: main
+      dim: 512                         # 落在独立的图片表，不与文本维度混用
+      batch_size: 8
 
 storage:
   lancedb_path: ~/.kb-gateway/data/lance
@@ -220,7 +233,7 @@ knowledge_bases:
     display_name: 通用规范与跨系统契约
     source_type: external              # 独立仓库，不属于任何业务工程
     repo: D:/code/kb-standards
-    include: ["**/*.md", "**/*.yaml", "**/*.sql", "**/*.png"]
+    include: ["**/*.md", "**/*.yaml", "**/*.sql", "**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.webp"]
     exclude: ["**/.git/**", "**/.obsidian/**", "**/_archive/**"]
     default_authority: contract        # 契约：检索结果带 authoritative 标记
     default_write: read_only           # 只读，Agent 只能提案
@@ -232,6 +245,7 @@ knowledge_bases:
     source_type: embedded              # 知识库目录在项目仓库内
     repo: D:/code/erp-core
     knowledge_root: knowledge          # 相对仓库根，随 git 版本走
+    include: ["**/*.md", "**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.webp"]
     index_mode: git-object             # 走对象库，不扫磁盘（详见配套文档《Branch + Worktree 与内嵌知识库》）
     index_ref: main                    # 默认索引并服务 main
     serve_refs: [main]                 # 对外可检索的 ref 白名单
@@ -272,7 +286,9 @@ knowledge_bases:
 | `serve_refs` | 分支白名单 | 对外可检索的 ref；新增分支必须显式登记 |
 | `allow_working_ref` | 布尔 | 是否允许 `ref=working:<task>` 索引未提交草稿 |
 | `vector_enabled` | 布尔 | 每库向量开关；关闭后仍维护 BM25，不产生 embedding 任务，检索明确降级 |
-| `embedding.active_profile` | profile ID | 全局活动向量模型；切换模型或维度会创建新索引代次，完成后原子切换 |
+| `embedding.active_profile` | profile ID | 全局活动文本向量模型；切换模型或维度会创建新索引代次，完成后原子切换 |
+| `embedding.vision_profile` | profile ID / 空 | 图片向量模型；为空时图片只走 caption 文本向量，检索结果带 `vision_disabled` 降级原因 |
+| `embedding.image` | 对象 | 图片入库策略：开关、体积/边长上限、最低边长、允许格式；越界图片跳过并计数，不阻塞队列 |
 
 **检索侧对应的参数变化：**
 
@@ -381,10 +397,60 @@ related: [cross-system/mapping-oms-erp.md]
 | **Markdown 表格** | 整表不切分；行数 > 20 时按 10 行一组切分并**重复表头** | 每块携带表头 + 前两行上下文 |
 | **代码块** | 整块保留，不参与语义切分；`sql` 块额外抽取表名/字段名进 BM25 | 单块，超过 800 token 按 `;` 分割 |
 | **接口 YAML（OpenAPI）** | 按 `paths` 下每个 endpoint 一块，块内拼入 `parameters + requestBody + responses` | 每 endpoint 一块 |
-| 图片 | 抽取 alt 文本 + 文件名 + 所在段落作为 caption 向量化；文件路径存入元数据供 `kb_read` 返回 | 每图一块 |
-| 图片（可选增强） | `embedding.vision: true` 时用多模态模型生成描述文本后走文本向量 | 每图一块 |
+| **图片（架构图 / ER 图 / 流程图）** | 抽取 alt 文本 + 文件名 + 所在段落作为 caption 做文本向量；同时用 `vision_profile` 生成图像向量，两路都可检索 | 每图一块：caption 块 + 图像向量行 |
+| 图片（未配置视觉模型） | 只保留 caption 文本向量，检索结果带 `degraded_reason=vision_disabled` | 每图一块 |
 
 **表格为什么必须单独处理：** 如果按行拍平，"OMS 订单号 → ERP so_id"这条映射会散落在两个相邻块里，检索命中率骤降。保留表头 + 重复表头是唯一能让单行映射独立可检索的办法。
+
+#### 3.5.1 图片与图表向量支持（架构图 / ER 图）
+
+架构图、ER 图、状态机图承载的是"关系"而不是"文字"，alt 文本通常只写了 `架构图`，靠 caption 检索必然落空。因此图片必须有自己的向量空间，而不是被降级成一段描述文字。
+
+**入库链路：**
+
+```
+Markdown ![](...) / <img> 引用
+  │
+  ├─ 1. 定位：解析相对路径（含 attachments/），校验落在 knowledge_root 内且未被 exclude
+  ├─ 2. 规范化：格式与体积校验 → 等比缩放（长边 ≤ max_edge）→ 计算 image_hash
+  ├─ 3. 去重：同 hash 图片只编码一次，多个文档引用共享同一向量行
+  ├─ 4. caption：alt 文本 + 文件名 + 所在段落首句 + 最近标题路径（heading_path）
+  ├─ 5. 双写：
+  │      · 文本表 kb_<kb_id>：caption 作为普通块，走 active_profile（文本模型）
+  │      · 图片表 kb_<kb_id>__img：图像向量，走 vision_profile（多模态模型）
+  └─ 6. 元数据：宽高、mime、原路径、所属 doc_id、git_ref 同时写入两张表
+```
+
+**为什么分成两张表：** 文本模型（如 bge-m3，1024 维）与视觉模型（如 Chinese-CLIP，512 维）维度不同，而 LanceDB 的向量列在建表时就固定了维度（见 [store.py](../../kb_gateway/store.py) 的 `_schema`）。每 kb 一张文本表加一张图片表，既保留各自的维度，又能独立重建——换视觉模型不必重算文本向量，反之亦然。检索时两张表各召回一批，再进 RRF 融合。
+
+**图片表字段（在文本表字段基础上替换/新增）：**
+
+| 字段 | 说明 |
+|---|---|
+| `image_hash` | 图片二进制哈希，用于去重与增量判断 |
+| `rel_path` / `abs_path` | 图片自身路径；文本表的 `path` 仍指向引用它的 Markdown |
+| `mime` / `width` / `height` | 渲染与过滤用；`svg` 未栅格化时不入库 |
+| `caption` | 检索命中后直接展示给 Agent 的说明文本 |
+| `vector` | `vision_profile` 输出的图像向量，归一化后存 `float32` |
+
+**检索语义：**
+
+| 查询形态 | 编码方式 | 结果 |
+|---|---|---|
+| 文本 query（"订单状态机怎么流转"） | `vision_profile` 的**文本塔**编码，在同一共享空间检索 | 返回图片块，`kind=image` |
+| 图片 query（Agent 传图 / 用户贴图） | 图像塔编码 | 返回视觉相似图片及其引用文档 |
+| 纯文本检索 | 只查文本表 | 与图片结果合并后按 RRF 排序 |
+
+**边界与降级：**
+
+- `embedding.image.enabled=false` 或 `vision_profile` 为空 → 图片仅保留 caption 文本块，`kb_search` 返回 `degraded_reason=vision_disabled`，不报错。
+- 视觉模型未下载 / 运行时不可用 → 该批图片任务标记失败可重试，文本检索不受影响。
+- 图片删除或引用被移除 → 按 `doc_id` + `image_hash` 级联删除图片行；仍有其他文档引用同一 hash 时保留。
+- CLIP 类模型**不擅长图内小字与字段名**：ER 图里的列名仍需 caption 兜底，因此规范要求 ER 图的 alt 文本必须写出核心实体与关系，而不是留空。
+- 检索只返回路径与元数据，不返回二进制；Agent 需要"看图"时由 `kb_read` 按 `max_size_mb` 内联返回 base64，超出则只给路径。
+- 图片向量只用于召回，最终是否可读取决于调用方 Agent 是否具备视觉能力；不具备时按 caption 使用。
+
+选型依据（为什么用 CLIP 类双塔而不是 VLM 生成描述）详见 [decisions/adr-003-向量模型与向量数据库选型.md](../decisions/adr-003-向量模型与向量数据库选型.md)。
 
 ### 3.6 检索流程（混合召回 + RRF）
 
@@ -402,6 +468,9 @@ query
   │
   ├─ 2. 向量召回：top_k * 3（仅 vector_enabled=true 且向量代次 ready）
   │    若向量关闭、未就绪或模型不可用则跳过，并记录 degraded_reason
+  │
+  ├─ 2b. 图片召回：query 用 vision_profile 文本塔编码，在 kb_<id>__img 表检索
+  │     仅 modalities 含 image 且图片表 ready 时执行；图片结果同样受前缀与授权裁剪
   │
   ├─ 3. BM25 召回：对 enriched_text（正文 + 表头 + 代码符号名）做全文检索，top_k * 3
   │
@@ -437,6 +506,8 @@ query
 ```
 
 `partition` 是从 `path` 前缀解析出来的分区名，用于让 Agent 知道"这条结果属于哪一类"，而不必再判断 kb_id。
+
+图片命中项的 `kind` 为 `image`，`content` 放 caption，另带 `image` 对象（`rel_path` / `mime` / `width` / `height` / `caption`），`path` 指向引用它的 Markdown。`matched_by` 会标明命中来自 `vector_image` 还是 `bm25`，便于调参时区分是"看懂图了"还是"只匹配了标题"。
 
 `abs_path` 与 `git_ref` 是溯源能力的核心：Agent 拿到结果后可以直接 `kb_read(abs_path)` 读全文，也可以在你人工核对时一眼定位到"哪条分支的哪个提交"。
 
@@ -488,8 +559,8 @@ Worker 产出                提案队列                    归档
 |---|---|---|---|
 | `kb_init_guide` | `source_type`, `repo?`, `kb_id?`, `knowledge_root=knowledge`, `check=false` | 初始化步骤、目录/front matter/registry 模板、接入命令；`check=true` 时附校验结果 | 指导其他项目创建并接入知识库 |
 | `kb_list` | `include_prefixes?` | kb 清单 + 每个库的 `doc_count / last_indexed / vector_enabled / default_authority / default_write` | Agent 启动时自检可用知识域 |
-| `kb_search` | `query`, `kb_id`, `prefixes[]`, `refs?`, `filters?`, `top_k=5`, `mode=hybrid` | 命中块数组（见 3.6 结构）+ `effective_mode / degraded_reason` | 主力检索入口 |
-| `kb_read` | `path` 或 `doc_id`, `with_frontmatter=true` | 原文全文 + front matter + git_ref | 精读单篇；也用于 Agent 读源码级文档 |
+| `kb_search` | `query`, `kb_id`, `prefixes[]`, `refs?`, `filters?`, `modalities=[text,image]`, `top_k=5`, `mode=hybrid` | 命中块数组（见 3.6 结构）+ `effective_mode / degraded_reason` | 主力检索入口；`modalities` 显式声明是否要图片结果 |
+| `kb_read` | `path` 或 `doc_id`, `with_frontmatter=true`, `inline_image=false` | 原文全文 + front matter + git_ref；图片路径返回元数据，`inline_image=true` 且未超限时附 base64 | 精读单篇或查看架构图 / ER 图 |
 | `kb_write_candidate` | `kb_id`, `target_path`, `content`, `reason`, `task_id` | `proposal_id` + 状态 | 产出沉淀 |
 | `kb_stat` | `kb_id`, `prefixes?` | 文档/分块/向量块统计、向量维度、`observed_rev/indexed_rev`、dirty 状态、队列数量、索引延迟、模型代次与最后错误 | 排查"文档明明有却搜不到" |
 | `kb_reindex` | `kb_id`, `ref=main`, `full=false` | `job_id` + `queued` 状态 | 异步手动修复索引 |
@@ -835,6 +906,7 @@ CREATE UNIQUE INDEX idx_lease_holder ON blackboard_lease(run_id, holder_agent);
 |---|---|---|
 | 知识库文档数 | 3~5 个库，每库 500~3000 篇 | LanceDB 单表 10 万级向量无压力 |
 | 分块总数 | 约 3~10 万块 | 单机内存索引约 200~400MB |
+| 图片总数 | 每库 100~1000 张架构图 / ER 图，512 维 `float32` | 约 2KB/条，1 万张仅 20MB，可忽略 |
 | 并发 Worker 数 | 3~6 | SQLite WAL 支持多读 + 单写串行，够用 |
 | 检索 QPS | 峰值 20~30（6 Worker × 每任务 5 次检索） | LanceDB 单机 50~100 QPS 可满足 |
 | 索引增量延迟 | 目标 < 30s | watcher debounce 5s + 增量 upsert 可达成 |
@@ -849,11 +921,13 @@ CREATE UNIQUE INDEX idx_lease_holder ON blackboard_lease(run_id, holder_agent);
 
 ```
 写入路径：变更事件 → debounce / 内容哈希 → SQLite 持久化入队 → 解析分块
-         → BM25 / metadata 更新 → embedding（仅 vector_enabled=true）
-         → LanceDB 按代次 upsert → 标记任务完成 → 推进索引版本
+         → BM25 / metadata 更新 → 文本 embedding + 图片编码（仅 vector_enabled=true）
+         → LanceDB 文本表 / 图片表按代次 upsert → 标记任务完成 → 推进索引版本
 
 一致性保证：
   · 每次 upsert 以 doc_id + model_generation 为粒度替换旧块，避免残留
+  · 文本表与图片表各自记录代次，换视觉模型只重建图片表
+  · 图片以 image_hash 去重，多文档引用共享同一向量行，引用计数归零才删除
   · 同一 doc 的并发修改由单一 indexer 写者串行发布，embedding 可有界并行
   · 索引状态表记录每个 doc 的 content_hash，hash 未变则跳过（幂等）
   · 任一文档任务失败则不推进对应 ref 的 indexed_rev，旧索引继续服务
@@ -1010,7 +1084,7 @@ uv sync --extra local-models
 | **P2 双形态与队列** | embedded 库 + git hook + watcher + 定时对账 + SQLite 持久化队列 + Web 索引状态 | 1~2 天 | 提交后 30 秒内入队可检索；重复事件幂等；hook 缺失可收敛；重启任务恢复 |
 | **P3 共享写与 Web** | proposal + base_version + 审计 + Web 知识库配置/提案 diff 审查 | 2 天 | 并发提案后者标 stale；Web 可新增配置知识库且不能批准 stale 提案 |
 | **P4 调度与薄层** | 现成 Agent 作调度器（OpenCode / Claude Code 原生 subagent）+ worktree 分配 + 黑板 + 产物合并 | 2~3 天 | 调度 Agent 自行拆解并派发子代理，各自在独立 worktree 工作，产物可合并、黑板数据正确传递 |
-| **P5 模型与闭环增强** | Web 线上/本地模型管理、按需 local-models、模型代次切换 + 产出归档/ADR/图片 caption | 2 天 | 基础安装无 ML 依赖；本地安装下载运行可观测；模型切换不混维度；知识流转闭环可运行 |
+| **P5 模型与闭环增强** | Web 线上/本地模型管理、按需 local-models、模型代次切换 + 产出归档/ADR/图片向量（架构图 / ER 图，双塔模型） | 2 天 | 基础安装无 ML 依赖；本地安装下载运行可观测；模型切换不混维度；文本与图片可分别重建；知识流转闭环可运行 |
 
 **建议严格按 P0→P5 推进，每个阶段结束你都应该能实际用起来。** 不要一次把 P4 的编排写完再回头调检索——检索质量不到位时，并行 Worker 只会更快地产出错误代码。
 
@@ -1078,6 +1152,7 @@ uv sync --extra local-models
 - **线上模型**：填写 provider、endpoint、model、dim、batch_size 和 API key。密钥保存为 `secret_ref`，读取接口只返回 `configured: true` 等脱敏状态；连接测试不会触发任何本地机器学习依赖安装。
 - **本地模型**：填写受支持的模型 ID、固定 revision 和运行时参数。模型文件只能下载到 `storage.model_cache_path` 内由服务生成的目录，拒绝自定义越界路径与目录穿越；记录下载进度、校验结果、runtime 状态和错误。
 - **状态展示**：运行时安装、模型下载、模型运行是三个独立状态。Web 分别展示 `installing/installed/failed`、下载百分比与 `stopped/starting/running/unhealthy`，失败可重试，切换模型后按第 9 章重建索引代次。
+- **视觉模型**：`vision_profile` 与 `active_profile` 分离管理，各自独立安装、下载、启停与切换。换视觉模型只重建图片表 `kb_<kb_id>__img`，文本代次不动；任一模型不可用时只降级对应模态，另一模态继续服务。
 
 ### 15.3 uv 与按需依赖
 
@@ -1127,6 +1202,9 @@ local-models = [
 | RRF 常数 k | 60 | 通用经验值 |
 | 权威加权 | contract ×1.15，frozen ×1.1 | 契约优先但不绝对压制 |
 | 并发 Worker 上限 | 3~4（本地模型）/ 6~8（云端模型） | 受 embedding 与 LLM 限流约束 |
+| 图片长边上限 | 2048（最低 224） | 兼顾 ER 图小字可读性与编码耗时，再大对 CLIP 收益递减 |
+| 单图向量维度 | 512（Chinese-CLIP ViT-B/16） | 图片表独立维度，与文本表解耦 |
+| 图片任务并发 | 1~2 | 图像编码在 CPU 上明显慢于文本，避免挤占文本队列 |
 | watcher debounce | 5s | 兼顾实时性与 embedding 开销 |
 | worktree 保留 | 合并后保留 7 天 | 供人工审查，之后按需清理 |
 | 提案单任务上限 | 3 条 | 防审核队列被淹没 |
